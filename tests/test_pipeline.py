@@ -642,17 +642,26 @@ if __name__ == "__main__":
     print(_bold("  Round 20 Pipeline – End-to-End Integration Test"))
     print(_bold("=" * 65))
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = pathlib.Path(tmpdir)
-        try:
-            run_pipeline(tmp_path)
-            print("\n" + "=" * 65)
-            print(_green(_bold("  ✓  ALL STAGES PASSED")))
-            print("=" * 65)
-            sys.exit(0)
-        except Exception:
-            print("\n" + "=" * 65)
-            print(_red(_bold("  ✗  PIPELINE FAILED")))
-            print("=" * 65)
-            traceback.print_exc()
-            sys.exit(1)
+    output_root = pathlib.Path("pipeline_outputs")
+    output_root.mkdir(exist_ok=True)
+
+    try:
+        run_pipeline(output_root)
+
+        print("\n" + "=" * 65)
+        print(_green(_bold("  ✓  ALL STAGES PASSED")))
+        print("=" * 65)
+
+        print(f"\nOutputs saved to: {output_root.resolve()}")
+
+        sys.exit(0)
+
+    except Exception:
+        print("\n" + "=" * 65)
+        print(_red(_bold("  ✗  PIPELINE FAILED")))
+        print("=" * 65)
+        traceback.print_exc()
+        sys.exit(1)
+
+
+
