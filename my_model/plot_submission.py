@@ -104,8 +104,11 @@ FIT_END_DATE: pd.Timestamp = pd.Timestamp("2026-06-06")
 ORIGIN_DATE: pd.Timestamp = pd.Timestamp("2025-06-08")
 PROJECTION_END_DATE: pd.Timestamp = pd.Timestamp("2027-06-05")  # horizon 104
 
-# Pre-projection window to show (8 weeks of observed history before origin)
-CHART_START_DATE: pd.Timestamp = ORIGIN_DATE - pd.Timedelta(weeks=8)
+# Chart starts at calibration window beginning (show full historical context)
+CHART_START_DATE: pd.Timestamp = pd.Timestamp("2024-01-01")
+
+# Forecast starts at ORIGIN_DATE — a vertical line marks this on all plots
+FORECAST_START_DATE: pd.Timestamp = ORIGIN_DATE
 
 # Large US states to highlight in state-level comparison plot
 # Chosen to represent diverse geography/population sizes for visible differences
@@ -184,9 +187,14 @@ def load_submission(path: pathlib.Path) -> pd.DataFrame:
 def load_observed(
     location: str = "US",
     age_group: str = "0-130",
+    min_date: Optional[pd.Timestamp] = None,
+    max_date: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     """
     Load observed inc hosp and inc death from ``target-data/time-series.csv``.
+
+    By default loads one full calibration year before ORIGIN_DATE through
+    FIT_END_DATE so calibration history is visible on plots.
 
     Returns a tidy DataFrame with columns ``date``, ``target``, ``value``.
     """
@@ -196,16 +204,54 @@ def load_observed(
         logger.warning("load_observed: %s not found; skipping observed overlay.", path)
         return pd.DataFrame(columns=["date", "target", "value"])
 
+    if min_date is None:
+        # Show one full year of calibration history before origin
+        min_date = pd.Timestamp("2024-01-01")
+    if max_date is None:
+        max_date = FIT_END_DATE
+
     raw = pd.read_csv(path, dtype={"location": str})
     raw["date"] = pd.to_datetime(raw["date"])
     obs = raw[
         (raw["location"] == location)
         & (raw["age_group"] == age_group)
         & (raw["target"].isin(["inc hosp", "inc death"]))
-        & (raw["date"] >= ORIGIN_DATE - pd.Timedelta(weeks=8))
-        & (raw["date"] <= FIT_END_DATE)
+        & (raw["date"] >= min_date)
+        & (raw["date"] <= max_date)
     ].rename(columns={"observation": "value"})[["date", "target", "value"]]
     return obs
+
+
+def load_calibration_fit(
+    location: str = "US",
+    target: str = "inc hosp",
+) -> pd.Series:
+    """
+    Return the deterministic SEIRS calibration fit as a pd.Series indexed by date.
+
+    Used to overlay the fitted epidemic curve on the observed data in plots.
+    Shows how well the SEIRS model reproduces the historical calibration period.
+
+    Returns empty Series on failure (graceful degradation).
+    """
+    try:
+        from simulate import (  # noqa: PLC0415
+            get_calibrated_params,
+            get_calibration_fit as _get_fit,
+            build_cal_dates,
+        )
+        params   = get_calibrated_params(location)
+        cal_dates = build_cal_dates(location=location)
+        fit_hosp  = _get_fit(params, cal_dates)
+
+        if target == "inc death":
+            # Deaths derived from hosp via the same ratio used in build_submission
+            from build_submission import HOSP_TO_DEATH_RATIO  # noqa: PLC0415
+            return fit_hosp * HOSP_TO_DEATH_RATIO
+        return fit_hosp
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("load_calibration_fit: failed for %s/%s – %s", location, target, exc)
+        return pd.Series(dtype=float)
 
 
 def _get_quantile_series(
@@ -287,13 +333,44 @@ def _draw_observed(
     obs: pd.DataFrame,
     target: str,
 ) -> None:
-    """Overlay observed data points on *ax* as black scatter with connecting line."""
+    """
+    Overlay observed data as a solid black line with small circle markers.
+
+    The black line shows the historical NHSN data prior to the forecast
+    origin date.  This is drawn below scenario bands (zorder=5) for clarity.
+    """
     sub = obs[obs["target"] == target].sort_values("date")
     if sub.empty:
         return
-    ax.plot(sub["date"], sub["value"], color="black", linewidth=1.2,
-            marker="o", markersize=3, zorder=5, label="Observed (NHSN/NCHS)",
-            alpha=0.85)
+    ax.plot(
+        sub["date"], sub["value"],
+        color="black", linewidth=1.8,
+        marker="o", markersize=3.5,
+        zorder=5, label="Observed (NHSN)",
+        alpha=0.90,
+    )
+
+
+def _draw_calibration_fit(
+    ax: plt.Axes,
+    fit: pd.Series,
+    label: str = "SEIRS calibration fit",
+) -> None:
+    """
+    Overlay the deterministic SEIRS calibration fit as a blue dashed line.
+
+    This shows how well the SEIRS model reproduces historical observations
+    during the calibration period.  A good calibration closely tracks the
+    black observed line, validating parameter estimates before forecasting.
+    """
+    if fit.empty:
+        return
+    ax.plot(
+        fit.index, fit.values,
+        color="#1a6eb5", linewidth=2.0,
+        linestyle="--", dashes=(5, 3),
+        zorder=6, label=label, alpha=0.9,
+    )
 
 
 def _draw_vax_lines(
@@ -326,19 +403,19 @@ def _draw_vax_lines(
 
 
 def _format_date_axis(ax: plt.Axes, n_weeks: int = 104) -> None:
-    """Apply consistent date formatting for a 2-year projection window.
+    """Apply consistent date formatting spanning calibration + projection window.
 
-    The chart spans from 8 weeks before the origin (Jun 2025) through all
-    104 projected horizons (Jun 2027).  Major ticks every 6 months with
-    month+year labels; minor ticks every month for readability.
+    The chart shows:
+    - Calibration period: Jan 2024 → Jun 2026 (historical fit)
+    - Forecast period:    Jun 2026 → Jun 2027 (prospective projection)
+
+    Major ticks quarterly (Jan, Apr, Jul, Oct) for a clean 3-year view.
     """
-    # Major ticks every 6 months (Jan and Jul) for a clean 2-year view
     ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
     ax.xaxis.set_minor_locator(mdates.MonthLocator(interval=1))
     ax.tick_params(axis="x", which="major", labelsize=8)
     ax.tick_params(axis="x", which="minor", length=2, labelsize=0)
-    # Ensure the full projection window is visible
     ax.set_xlim(CHART_START_DATE, PROJECTION_END_DATE + pd.Timedelta(weeks=2))
 
 
@@ -347,6 +424,42 @@ def _format_yaxis(ax: plt.Axes) -> None:
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(
         lambda x, _: f"{int(x):,}" if x == int(x) else f"{x:,.0f}"
     ))
+
+
+def _draw_period_markers(ax: plt.Axes) -> None:
+    """
+    Draw period-separation markers on the axes:
+
+    - Light blue shading for the calibration period (Jan 2024 – Jun 2025)
+    - Light yellow shading for the retrospective period (Jun 2025 – Jun 2026)
+    - A vertical dashed red line at ORIGIN_DATE marking forecast start
+    - A vertical grey line at FIT_END_DATE marking end of observed data
+
+    These markers make it visually clear which part of the plot is
+    calibration history, which is retrospective, and which is future forecast.
+    """
+    # Calibration history shading (before origin date)
+    ax.axvspan(
+        CHART_START_DATE, ORIGIN_DATE,
+        color="#e8f4f8", alpha=0.55, zorder=0, label="Calibration period",
+    )
+    # Retrospective + prospective forecast shading
+    ax.axvspan(
+        ORIGIN_DATE, PROJECTION_END_DATE,
+        color="#fff8e8", alpha=0.40, zorder=0, label="Forecast period",
+    )
+    # Vertical line at forecast start (ORIGIN_DATE)
+    ax.axvline(
+        ORIGIN_DATE, color="#cc3333", linewidth=1.5,
+        linestyle="--", alpha=0.85, zorder=4,
+        label=f"Forecast start ({ORIGIN_DATE.strftime('%b %Y')})",
+    )
+    # Vertical line at end of observed data (FIT_END_DATE)
+    ax.axvline(
+        FIT_END_DATE, color="#555555", linewidth=1.0,
+        linestyle=":", alpha=0.7, zorder=4,
+        label=f"Last observed ({FIT_END_DATE.strftime('%b %Y')})",
+    )
 
 
 # ===========================================================================
@@ -406,10 +519,17 @@ def plot_scenario_comparison(
     for ax, target in zip(axes, targets):
         meta = TARGET_META.get(target, {"title": target, "ylabel": "Count"})
 
-        # Draw observed data first (background layer)
+        # ── Period shading and vertical markers (drawn first, behind data) ──
+        _draw_period_markers(ax)
+
+        # ── Observed data: solid black line ──────────────────────────────
         _draw_observed(ax, observed, target)
 
-        # Draw each scenario band
+        # ── SEIRS calibration fit: blue dashed line ───────────────────────
+        cal_fit = load_calibration_fit(location=location, target=target)
+        _draw_calibration_fit(ax, cal_fit)
+
+        # ── Scenario forecast bands ───────────────────────────────────────
         for sid in scenario_ids:
             label, color, linestyle = SCENARIO_STYLE[sid]
             p05 = _get_quantile_series(df, sid, target, 0.05,  age_group)
@@ -423,7 +543,6 @@ def plot_scenario_comparison(
                 )
                 continue
 
-            # Align all three series to the same index
             common_idx = p50.index
             p05 = p05.reindex(common_idx).ffill().bfill()
             p95 = p95.reindex(common_idx).ffill().bfill()
@@ -434,21 +553,15 @@ def plot_scenario_comparison(
                 color, linestyle, label,
             )
 
-        # Axis decoration
+        # ── Axis decoration ───────────────────────────────────────────────
         ax.set_title(meta["title"])
         ax.set_xlabel("Date")
         ax.set_ylabel(meta["ylabel"])
         _format_yaxis(ax)
-
-        # Shade the retrospective period (Jun 2025 → Jun 2026)
-        ax.axvspan(ORIGIN_DATE, FIT_END_DATE,
-                   color="#eeeeee", alpha=0.4, zorder=0,
-                   label="Retrospective period")
-
-        _format_date_axis(ax)  # sets xlim to full 2-year window
+        _format_date_axis(ax)
         ax.set_ylim(bottom=0)
 
-        # Draw vaccination lines after ylim is set
+        # Vaccination reference lines (after ylim set for correct annotation y)
         _draw_vax_lines(ax)
 
     # ── Legend ─────────────────────────────────────────────────────────────
@@ -539,15 +652,18 @@ def plot_submission(
     for ax, target in zip(axes_flat, targets):
         meta = TARGET_META.get(target, {"title": target, "ylabel": "Count"})
 
-        # Retrospective shading (behind everything)
-        ax.axvspan(ORIGIN_DATE, FIT_END_DATE,
-                   color="#eeeeee", alpha=0.45, zorder=0,
-                   label="Retrospective period (Jun 2025 – Jun 2026)")
+        # ── Period shading and vertical markers ───────────────────────────
+        _draw_period_markers(ax)
 
-        # Observed data
+        # ── Observed data: solid black line ──────────────────────────────
         _draw_observed(ax, observed, target)
 
-        # Scenario bands
+        # ── SEIRS calibration fit (inc hosp + inc death only) ─────────────
+        if target in ("inc hosp", "inc death"):
+            cal_fit = load_calibration_fit(location=location, target=target)
+            _draw_calibration_fit(ax, cal_fit)
+
+        # ── Scenario forecast bands ───────────────────────────────────────
         for sid in scenario_ids:
             label, color, linestyle = SCENARIO_STYLE[sid]
             p05 = _get_quantile_series(df, sid, target, 0.05, age_group)
@@ -567,15 +683,13 @@ def plot_submission(
                 color, linestyle, label,
             )
 
-        # Axis decoration
+        # ── Axis decoration ───────────────────────────────────────────────
         ax.set_title(meta["title"], pad=6)
         ax.set_ylabel(meta["ylabel"])
         ax.set_xlabel("")
-        _format_date_axis(ax)   # sets xlim to full 2-year window
+        _format_date_axis(ax)
         _format_yaxis(ax)
         ax.set_ylim(bottom=0)
-
-        # Vaccination lines (after ylim is set so annotation y is correct)
         _draw_vax_lines(ax)
 
     # Add x-label only to bottom row
@@ -692,7 +806,32 @@ def plot_state_comparison(
     for row_idx, fips in enumerate(states):
         ax = axes[row_idx]
         state_df = df[(df["location"] == fips) & (df["age_group"] == age_group)]
+        name = state_names.get(fips, fips)
 
+        # ── Period shading ────────────────────────────────────────────────
+        ax.axvspan(CHART_START_DATE, ORIGIN_DATE,
+                   color="#e8f4f8", alpha=0.50, zorder=0)
+        ax.axvspan(ORIGIN_DATE, PROJECTION_END_DATE,
+                   color="#fff8e8", alpha=0.35, zorder=0)
+        ax.axvline(ORIGIN_DATE, color="#cc3333", linewidth=1.2,
+                   linestyle="--", alpha=0.8, zorder=4)
+
+        # ── Observed data for this state ──────────────────────────────────
+        try:
+            state_obs_df = load_observed(location=fips)
+            _draw_observed(ax, state_obs_df, target)
+        except Exception:
+            pass
+
+        # ── SEIRS calibration fit for this state ──────────────────────────
+        try:
+            state_fit = load_calibration_fit(location=fips, target=target)
+            _draw_calibration_fit(ax, state_fit,
+                                   label=f"SEIRS fit ({name})" if row_idx == 0 else "_nolegend_")
+        except Exception:
+            pass
+
+        # ── Scenario forecast bands ───────────────────────────────────────
         for sid in scenarios:
             label, color, linestyle = SCENARIO_STYLE.get(
                 sid, (sid, "#999999", "solid")
@@ -706,18 +845,15 @@ def plot_state_comparison(
             p05 = p05.reindex(common_idx).ffill().bfill()
             p95 = p95.reindex(common_idx).ffill().bfill()
             ax.fill_between(common_idx, p05.values, p95.values,
-                            color=color, alpha=0.10, linewidth=0)
+                            color=color, alpha=0.12, linewidth=0)
             ax.plot(common_idx, p50.values, color=color,
                     linestyle=linestyle, linewidth=1.6,
                     label=label if row_idx == 0 else "_nolegend_")
 
-        # State label as y-axis title
-        name = state_names.get(fips, fips)
         ax.set_ylabel(f"{name}\n({fips})", fontsize=9, labelpad=4)
         ax.set_title(f"{name} – {target}", fontsize=9, pad=3)
         _format_yaxis(ax)
         ax.set_ylim(bottom=0)
-        ax.axvspan(ORIGIN_DATE, FIT_END_DATE, color="#eeeeee", alpha=0.4, zorder=0)
 
     # ── Summary row: Absolute scenario spread (A minus E per state) ────────
     ax_summary = axes[-1]

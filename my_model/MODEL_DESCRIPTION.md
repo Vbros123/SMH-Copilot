@@ -1,278 +1,310 @@
 # Model Description — Round 20 COVID-19 Scenario Modeling Hub
 
+**Team:** MyTeam-ProtoModel  
+**Round:** 20  
+**Projection period:** Jun 8, 2025 → Jun 5, 2027 (104 epi-weeks)  
+**Calibration period:** Jan 1, 2024 → Jun 6, 2026  
+
+---
+
 ## Overview
 
-This prototype submission uses a **stochastic log-growth random-walk model
-with dual-harmonic seasonal forcing** to produce 300 paired trajectories
-per scenario.  The model is framed as a **discrete-time stochastic
-difference equation** operating in log-space, which is mathematically
-equivalent to a geometric Brownian motion (GBM) sampled at weekly intervals.
+This submission uses a **stochastic SEIRS compartmental model** with seasonal
+transmission forcing, waning immunity, and vaccination-mediated susceptibility
+reduction.  The model is implemented in discrete weekly time steps and calibrated
+independently for each location against observed NHSN weekly hospitalisations.
 
 ---
 
-## Model Type
+## Compartments
 
-| Property | Value |
-|----------|-------|
-| Framework | Stochastic discrete-time difference equation (log-space GBM) |
-| Compartments | None (reduced-form / semi-mechanistic) |
-| ODE system | See §3 for the equivalent continuous-time ODE |
-| Observations fitted | Weekly incident hospitalisations (`inc hosp`) |
-| Deaths derived | Proportional to hospitalisations via HOSP_TO_DEATH_RATIO = 6.5% |
-| Trajectories | 300 independent samples per scenario |
-| Projection horizon | 104 epi-weeks (Jun 2025 – Jun 2027) |
+| Symbol | Name | Description |
+|--------|------|-------------|
+| S | Susceptible | No current immunity; can be infected |
+| E | Exposed | Infected but not yet infectious (latent period) |
+| I | Infectious | Actively infectious; drives transmission |
+| R | Recovered | Post-infectious immunity; wanes back to S |
+
+Observable output (not a compartment):
+
+$$
+H(t) = \frac{I(t)}{D_I} \cdot p_{\text{hosp}} \cdot N
+$$
+
+where $H(t)$ is weekly incident hospitalisations, $D_I$ is the mean infectious
+period, $p_{\text{hosp}}$ is the infection-hospitalisation rate, and $N$ is the
+population.
 
 ---
 
-## 1  State Variables
+## ODE / Difference Equations
 
-The model tracks a single observable state:
-
-$$
-H(t) = \text{weekly incident hospitalisations in epi-week } t
-$$
-
-All computation is performed in log-space:
+The discrete-time weekly system is:
 
 $$
-h(t) = \ln H(t)
+\lambda(t) = \frac{\beta(t) \cdot I(t)}{N}
+$$
+
+$$
+\Delta E(t)  = S(t) \cdot \lambda(t) \quad \text{(new exposures — stochastic, see below)}
+$$
+
+$$
+\Delta I(t)  = \frac{E(t)}{D_E}  \quad \text{(latency progression)}
+$$
+
+$$
+\Delta R(t)  = \frac{I(t)}{D_I}  \quad \text{(recovery)}
+$$
+
+$$
+\Delta S(t)  = R(t) \cdot \omega  \quad \text{(waning immunity)}
+$$
+
+where $\omega = 1 - e^{-1/\tau_R}$ is the weekly waning rate.
+
+Compartment updates:
+
+$$
+S(t+1) = S(t) - \Delta E(t) + \Delta S(t)
+$$
+$$
+E(t+1) = E(t) + \Delta E(t) - \Delta I(t)
+$$
+$$
+I(t+1) = I(t) + \Delta I(t) - \Delta R(t)
+$$
+$$
+R(t+1) = R(t) + \Delta R(t) - \Delta S(t)
 $$
 
 ---
 
-## 2  Stochastic Difference Equation
+## Seasonality Equation
 
-### 2.1  Core recursion
-
-For trajectory $i$ and week $t$:
+Transmission rate is modulated by a seasonal cosine forcing:
 
 $$
-h_i(t) = h_i(t-1) + \mu^* + s(t) + \varepsilon_i(t)
+\beta(t) = \beta_0 \left(1 + A \cos\!\left(\frac{2\pi(t - \varphi)}{52}\right)\right)
 $$
 
-where:
+| Parameter | Symbol | Default | Description |
+|-----------|--------|---------|-------------|
+| Baseline transmission | $\beta_0$ | calibrated | Weekly transmission rate (week⁻¹) |
+| Seasonal amplitude | $A$ | calibrated | Fraction of variation (0–1) |
+| Phase offset | $\varphi$ | calibrated | Epi-week of seasonal peak (1–52) |
 
-| Symbol | Definition |
-|--------|-----------|
-| $h_i(t)$ | $\ln H_i(t)$, log-hospitalisation for trajectory $i$ at week $t$ |
-| $\mu^*$ | Damped trend drift: $\mu^* = (1 - \alpha_r)\,\hat\mu$ |
-| $\hat\mu$ | Estimated mean log-growth rate from the 26-week calibration window |
-| $\alpha_r$ | Mean-reversion strength = 0.15 (prevents divergence over 104 weeks) |
-| $s(t)$ | Dual-harmonic seasonal forcing (see §2.2) |
-| $\varepsilon_i(t)$ | Innovation: $\varepsilon_i(t) \overset{iid}{\sim} \mathcal{N}(0,\,\hat\sigma^2)$ |
-
-The observation in natural units is recovered as:
-
-$$
-H_i(t) = \max\!\bigl(\exp(h_i(t)),\; H_{\min}\bigr), \quad H_{\min} = 200 \text{ (US national floor)}
-$$
-
-### 2.2  Dual-harmonic seasonal forcing
-
-COVID-19 hospitalisations exhibit **two seasonal peaks per year**: a primary
-winter peak (≈ January 18) and a secondary summer peak (≈ July 15).  The
-seasonal component is the week-to-week derivative of the sum of two
-sinusoids in log-count space:
-
-$$
-S(t) = A_1 \sin\!\Bigl(\omega(d(t) - d_1)\Bigr)
-     + A_2 \sin\!\Bigl(\omega(d(t) - d_2)\Bigr)
-$$
-
-The seasonal component in log-count space uses a **Fourier dual-harmonic** form
-fitted to 2023–2026 US NHSN weekly data by OLS:
-
-$$
-S(d) = \underbrace{a_{1c}\cos(\omega d) + a_{1s}\sin(\omega d)}_{\text{annual harmonic}}
-     + \underbrace{a_{2c}\cos(2\omega d) + a_{2s}\sin(2\omega d)}_{\text{semi-annual harmonic}}
-$$
-
-where $d$ = day-of-year.  The annual harmonic captures the dominant winter peak
-(≈ early January); the semi-annual harmonic captures the secondary summer peak
-(≈ August/September), producing the **two peaks per year** required by Round 20.
-
-**The trajectory generator uses $S(d)$ directly (level model), not its derivative.**
-This avoids the cumulative-drift collapse that occurs when the derivative
-approach is applied over a 104-week horizon starting at a seasonal trough.
-
-| Coefficient | Value | Description |
-|-------------|-------|-------------|
-| $\omega$ | $2\pi/365.25$ rad/day | Annual angular frequency |
-| $a_{1c}$ | 0.492 | Annual cosine coefficient (fitted OLS, 2023–2026) |
-| $a_{1s}$ | −0.026 | Annual sine coefficient |
-| $a_{2c}$ | −0.006 | Semi-annual cosine coefficient |
-| $a_{2s}$ | 0.436 | Semi-annual sine coefficient |
-
-The drift $s(t)$ in the ODE representation is the derivative of $S$ (×7 for weekly units),
-but is not used directly in the discrete trajectory generator.
-
-The derivative form is used so that $H(t)$ follows the *shape* of the
-double-sinusoidal seasonal curve — both the winter 2026-27 peak and the
-summer 2026 peak emerge naturally from this forcing.
+**Physical interpretation:** $\beta(t)$ oscillates between $\beta_0(1-A)$ in the
+trough and $\beta_0(1+A)$ at the peak.  For endemic stability, $\beta_0 \cdot D_I > 1$
+(i.e., $R_0 > 1$), ensuring the endemic equilibrium exists.  The seasonal forcing
+drives annual epidemic waves around this endemic state.
 
 ---
 
-## 3  Equivalent Continuous-Time ODE
+## Noise Model
 
-The discrete recursion in §2.1 corresponds to the following
-**stochastic differential equation (SDE)** in continuous time:
-
-$$
-\frac{dh}{dt} = \mu^* + s(t) + \sigma\,\frac{dW}{dt}
-$$
-
-where $W(t)$ is a standard Wiener process (Brownian motion).  In the
-epidemic literature this is an **additive noise** model for the
-log-epidemic trajectory.
-
-Equivalently, in terms of the count $H = e^h$:
+New exposures are drawn from a **negative-binomial distribution** to capture
+overdispersed transmission (super-spreading):
 
 $$
-\frac{dH}{dt} = H(t)\!\left[\mu^* + s(t) + \tfrac{1}{2}\sigma^2\right] + H(t)\,\sigma\,\frac{dW}{dt}
+\Delta E(t) \sim \text{NegBin}\!\left(\mu = S(t)\lambda(t),\; \varepsilon = 0.10\right)
 $$
 
-This is a **geometric Brownian motion with seasonal drift**, the simplest
-continuous-time ODE consistent with exponential epidemic growth/decay and
-log-normal forecast uncertainty.
-
-> **Note on recursion and ODE equivalence.**  The discrete recursion
-> $h_i(t) = h_i(t-1) + \mu^* + s(t) + \varepsilon_i(t)$ is *not* circular;
-> it is a first-order Markov process — each step depends only on the
-> immediately preceding value.  The ODE form above is the formal
-> continuous-time limit (Itô convention).  Numerically, the discrete-time
-> version is used because the hub submissions require weekly counts.
+where $\varepsilon$ is the overdispersion parameter (variance = $\mu + \varepsilon \mu^2$).
+Setting $\varepsilon = 0$ reduces to Poisson noise.  The value $\varepsilon = 0.10$
+is consistent with COVID-19 transmission cluster data (Lloyd-Smith et al. 2005).
 
 ---
 
-## 4  Vaccination Adjustment (Scenario Multiplier)
+## Vaccination Implementation
 
-Scenarios B–E modify the baseline trajectories by a **deterministic
-per-week multiplier** $M_k(t)$ that represents the reduction in
-susceptibility due to vaccination under scenario $k$:
-
-$$
-H_k(t) = H_A(t) \times M_k(t), \quad M_k(t) \in [0.5,\, 1.0]
-$$
-
-### 4.1  Population-level protection
-
-The multiplier is derived from the **convolution** of the weekly
-vaccination rate $\Delta V(s)$ with the time-varying effective vaccine
-effectiveness $\mathrm{VE}(t-s)$:
+Vaccination is modelled as a **per-week multiplicative reduction** in effective
+susceptibility:
 
 $$
-P(t) = \sum_{s \leq t} \Delta V(s) \cdot \mathrm{VE}(t - s) \cdot w
+S_{\text{eff}}(t) = S(t) \cdot M_k(t)
+$$
+
+where $M_k(t) \in [0.5, 1.0]$ is the scenario-specific protection multiplier for
+scenario $k$ at week $t$.
+
+The multiplier is derived from the convolution of weekly vaccination rates with
+time-varying effective vaccine effectiveness:
+
+$$
+P(t) = \sum_{s \leq t} \Delta V(s) \cdot \mathrm{VE}(t - s)
 $$
 
 $$
 M_k(t) = 1 - P_{\text{fall}}(t) - P_{\text{spring}}(t)
 $$
 
-where $w$ is a population weight (1.0 for whole-population campaigns,
-$f_{\text{HR}} = 0.30$ for high-risk-only spring campaigns).
-
-### 4.2  Effective VE with waning and immune escape
+Effective VE with waning and immune escape:
 
 $$
 \mathrm{VE}(\tau) = \mathrm{VE}_0
-  \underbrace{\Bigl[\varphi + (1-\varphi)\,e^{-\lambda\tau}\Bigr]}_{\text{waning factor}}
+  \underbrace{\left[\varphi_{\text{wane}} + (1-\varphi_{\text{wane}})\,e^{-\lambda\tau}\right]}_{\text{waning}}
   \underbrace{(1 - \kappa)^{\tau/52}}_{\text{immune escape}}
 $$
 
 | Symbol | Value | Description |
 |--------|-------|-------------|
 | $\mathrm{VE}_0$ | 0.55 | Initial VE against hospitalisation (round20.md) |
-| $\varphi$ | 0.50 | Waned plateau fraction (residual VE / VE_0) |
-| $\lambda$ | $\ln 2 / 26$ week$^{-1}$ | Exponential waning rate (half-life = 26 weeks) |
-| $\tau$ | — | Weeks since vaccination |
-| $\kappa$ | 0.35 yr$^{-1}$ | Annual immune escape fraction (midpoint 20–50%) |
-
-### 4.3  Scenario specifications
-
-| Scenario | Fall 2026-27 | Spring 2026 (HR only) | Fall coverage | Spring coverage |
-|----------|-------------|----------------------|---------------|-----------------|
-| A | ✗ | ✗ | 0% | 0% |
-| B | ✓ (BaU) | ✗ | 33% | 0% |
-| C | ✓ (BaU) | ✓ | 33% | 16.5% |
-| D | ✓ (Opt) | ✗ | 59% | 0% |
-| E | ✓ (Opt) | ✓ | 59% | 29.5% |
+| $\varphi_{\text{wane}}$ | 0.50 | Residual VE fraction at waned plateau |
+| $\lambda$ | $\ln 2 / 26$ week⁻¹ | Exponential waning rate (half-life = 26 weeks) |
+| $\kappa$ | 0.35 yr⁻¹ | Annual immune escape fraction |
 
 ---
 
-## 5  Death Derivation
+## Transition Rates and Parameter Definitions
 
-Incident deaths are derived from hospitalisation trajectories using a fixed
-case-hospitalisation-fatality ratio:
+| Parameter | Symbol | Value | Source |
+|-----------|--------|-------|--------|
+| Mean latent period | $D_E$ | 1.5 weeks | He et al. Nat Med 2020 |
+| Mean infectious period | $D_I$ | 1.5 weeks | Cevik et al. Lancet Microbe 2021 |
+| Waning timescale | $\tau_R$ | 78 weeks | Levin et al. Nat Commun 2022 |
+| NB overdispersion | $\varepsilon$ | 0.10 | Lloyd-Smith et al. Nature 2005 |
+| IHR multiplier | $p_{\text{hosp}}$ | calibrated | NHSN 2024-26 |
+| In-hospital CFR | $r_{\text{HD}}$ | 0.065 | CDC NCHS 2025-26 |
+| Initial recovered fraction | $f_{R,0}$ | 0.33 | Near endemic equilibrium |
+
+---
+
+## Calibration Method
+
+Parameters are fitted by **Nelder-Mead minimisation** of the sum of squared
+log-residuals between simulated and observed weekly hospitalisations:
 
 $$
-D(t) = H(t) \times r_{\text{HD}}, \quad r_{\text{HD}} = 0.065 \ (6.5\%)
+\mathcal{L}(\theta) = \sum_{t: H^{\text{obs}}_t > 0} \left(\ln H^{\text{sim}}_t(\theta) - \ln H^{\text{obs}}_t\right)^2
 $$
 
-This is a simplification; a full model would run independent death
-trajectories seeded from infection counts.
+A **stability penalty** is added to prevent runaway growth:
+
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{fit}} + \alpha \cdot \max\!\left(0,\, \frac{\max H^{\text{sim}}_{\text{future}}}{2 \cdot \max H^{\text{obs}}} - 1\right)^2
+$$
+
+Optimised parameters per location: $\{\beta_0, A, \varphi, p_{\text{hosp}}, \log_{10}(I_0/N)\}$
+
+Parameter bounds enforced during calibration:
+
+| Parameter | Lower | Upper | Rationale |
+|-----------|-------|-------|-----------|
+| $\beta_0$ | 0.68 | 6.3 | Ensures $R_0 = \beta_0 D_I > 1$ (endemic condition) |
+| $A$ | 0.05 | 0.85 | Non-trivial seasonality |
+| $\varphi$ | 0 | 52 | Any week of year |
+| $p_{\text{hosp}}$ | 0.03% | 3% | COVID-19 IHR literature range |
+| $\log_{10}(I_0/N)$ | −4.0 | −0.5 | Initial infectious fraction |
 
 ---
 
-## 6  Parameter Estimation
+## State-Specific Fitting
 
-| Parameter | Method | Window |
-|-----------|--------|--------|
-| $\hat\mu$ (drift) | Sample mean of log-differences | 52 most-recent weeks (full seasonal cycle) |
-| $\hat\sigma$ (volatility) | Sample std of log-differences (ddof=1) | 52 most-recent weeks |
-| $A_1, A_2, d_1, d_2$ | Fixed; calibrated from US national 2023–2026 data | Full history |
-| $\alpha_r$ (mean reversion) | Fixed; 0.15 | — |
+Each location (US national + 50 states + territories) is calibrated independently
+using its own observed hospitalisation series from `target-data/time-series.csv`.
+Population data is loaded from `auxiliary-data/data-locations/locations.csv`.
 
----
-
-## 7  Key Assumptions
-
-| # | Assumption | Justification |
-|---|-----------|--------------|
-| A1 | Log-growth rates are stationary over 52 weeks | One full seasonal year; mean ≈ 0 for endemic seasonal pathogen |
-| A2 | Innovations are i.i.d. Normal | Parsimony; tail risk partially captured by seasonal forcing |
-| A3 | Dual-harmonic sinusoidal seasonality | Observed summer + winter COVID-19 peaks in 2023–2026 NHSN data |
-| A4 | Geometric Brownian motion on counts | Ensures non-negativity; percentage uncertainty grows with horizon |
-| A5 | Trajectories paired across scenarios via shared seed | Required by round20.md pairing convention |
-| A6 | Endemic floor $H_{\min} = 200$ nationally | COVID-19 remains endemic; NHSN data never below 100/week since 2020 |
+State-specific calibration allows the model to capture differences in:
+- **Baseline transmission** $\beta_0$ (population density, behaviour)
+- **Seasonal amplitude** $A$ (climate, indoor crowding patterns)
+- **Seasonal phase** $\varphi$ (timing of winter vs. summer waves by latitude)
+- **IHR** $p_{\text{hosp}}$ (age structure, healthcare access, vaccination rates)
+- **Initial epidemic state** $I_0$ (current infection burden)
 
 ---
 
-## 8  Collaboration / Multi-State Extension
+## Seeding Strategy (Calibration vs. Forecast)
 
-For state-level submissions, the same model structure is applied
-independently to each state using state-specific observation series.
-The scenario multipliers use **national** vaccination coverage curves
-from `auxiliary-data/vaccination-coverage/COVID_RD20_Vaccination_curves.csv`
-as a proxy; teams with state-level coverage data should substitute those
-directly into `build_protection_schedule()`.
+The separation of calibration and forecast periods is critical for correct
+temporal interpretation:
 
-The model is **not** a metapopulation model — state trajectories are
-generated independently.  Spatial coupling (travel, commuting) is not
-modelled in this prototype.
+1. **Calibration** (`simulate.calibrate_seirs`): Fit SEIRS parameters against
+   NHSN data from Jan 2024 → Jun 2026 using deterministic (noise-free) dynamics.
+
+2. **Warm-up** (`stochastic_simulate.generate_trajectories`): Run the
+   deterministic SEIRS from `CAL_START` to `ORIGIN_DATE` (Jun 8, 2025) to
+   determine the compartment state at the forecast start.
+
+3. **Projection** (`simulate.generate_seirs_trajectories`): Generate 300
+   stochastic trajectories from the warm-up state through 104 forecast weeks
+   (Jun 2025 → Jun 2027).
+
+This design ensures the forecast begins at the epidemiologically correct state,
+and the calibration period is never mixed with the forecast period on plots.
 
 ---
 
-## 9  File Structure
+## Scenario Implementation
+
+Scenarios A–E modify only the **vaccination protection multiplier** $M_k(t)$
+applied to effective susceptibles.  The underlying SEIRS parameters
+($\beta_0, A, \varphi, D_E, D_I, \tau_R$) are **identical across all scenarios**.
+
+| Scenario | Description | Fall 2026-27 campaign | Spring 2026 HR campaign |
+|----------|-------------|----------------------|-------------------------|
+| A | No further vaccination | ✗ | ✗ |
+| B | BaU annual coverage | ✓ (33%) | ✗ |
+| C | BaU + spring HR | ✓ (33%) | ✓ (16.5%) |
+| D | Optimistic annual | ✓ (59%) | ✗ |
+| E | Optimistic + spring HR | ✓ (59%) | ✓ (29.5%) |
+
+Scenario ordering: A > B > C > D > E (decreasing hospitalisations with more vaccination).
+
+---
+
+## Known Limitations
+
+1. **Calibration quality**: The Nelder-Mead optimiser finds a local minimum.
+   The calibration fit underestimates the observed peak magnitude in some
+   locations.  A global optimisation method (differential evolution, MCMC)
+   would improve parameter recovery.
+
+2. **Single-age model**: All compartments are age-homogeneous.  Age-stratified
+   IHR and vaccination coverage vary substantially; this simplification
+   underestimates scenario heterogeneity.
+
+3. **Deaths derived**: Deaths are computed as $H(t) \times r_{\text{HD}} = 0.065$
+   rather than from an independent death compartment.  This ignores variation
+   in case fatality by age and variant.
+
+4. **Independent state simulations**: States are modelled independently with
+   no spatial coupling.  Interstate travel and commuting are not modelled.
+
+5. **Fixed structural parameters**: $D_E$, $D_I$, $\tau_R$, and $\varepsilon$
+   are fixed at literature-based national defaults and not fitted per location.
+   State-level variation in these quantities is ignored.
+
+6. **Immune escape**: Modelled only in the vaccination multiplier, not in the
+   SEIRS transmission dynamics.  Antigenic drift could change $\beta_0$ over
+   time (not captured).
+
+7. **Variant emergence**: No mechanism for sudden jumps in transmissibility
+   from new variant emergence.
+
+---
+
+## File Structure
 
 ```
 my_model/
-├── MODEL_DESCRIPTION.md       ← this file
-├── simulate.py                ← entry point (builds submission end-to-end)
-├── stochastic_simulate.py     ← §2 dual-harmonic GBM trajectory generator
-├── scenario_adjustments.py    ← §4 vaccination multiplier / VE model
-├── build_submission.py        ← §5 hub parquet assembly & validation
-├── plot_submission.py         ← visualization (US + state-level charts)
-└── load_data.py               ← data loading (NHSN, locations, vax curves)
+├── MODEL_DESCRIPTION.md         ← this file
+├── simulate.py                  ← SEIRS model + calibration (core)
+├── stochastic_simulate.py       ← public API (backward-compatible interface)
+├── scenario_adjustments.py      ← vaccination multiplier (Scenarios A–E)
+├── build_submission.py          ← hub parquet assembly & validation
+├── plot_submission.py           ← publication-quality visualisation
+└── load_data.py                 ← data loading (NHSN, locations, vax curves)
 ```
 
 ---
 
-## 10  References
+## References
 
-- Round 20 scenario specification: `auxiliary-data/rounds/round20.md`
-- Submission format: `model-output/README.md`
-- Vaccination coverage curves: `auxiliary-data/vaccination-coverage/`
-- CDC NHSN weekly hospitalisations: `target-data/time-series.csv`
-- Oksendal, B. (2003). *Stochastic Differential Equations*, 6th ed. Springer.
-- Black, F. & Scholes, M. (1973). The pricing of options. *J. Political Economy.*
-  (GBM framework basis)
+1. He X, et al. (2020). Temporal dynamics in viral shedding and transmissibility of COVID-19. *Nature Medicine* 26:672–675.
+2. Cevik M, et al. (2021). SARS-CoV-2, SARS-CoV, and MERS-CoV viral load and shedding kinetics. *Lancet Microbe* 2:e13-e22.
+3. Levin AT, et al. (2022). Assessing the burden of COVID-19 in developing countries. *Nature Communications* 13:1–10.
+4. Lloyd-Smith JO, et al. (2005). Superspreading and the effect of individual variation on disease emergence. *Nature* 438:355–359.
+5. Kissler SM, et al. (2020). Projecting the transmission dynamics of SARS-CoV-2 through the postpandemic period. *Science* 368:860–868.
+6. CDC NHSN COVID-19 Hospitalization Data. https://www.cdc.gov/nhsn/covid19/
+7. Round 20 scenario specification: `auxiliary-data/rounds/round20.md`
