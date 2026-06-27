@@ -629,9 +629,17 @@ def build_scenario_multipliers(
         )
 
     # ── Apply physical bounds ──────────────────────────────────────────────
-    # Lower bound 0.10: prevents collapse to implausibly small values in a
-    # simplified model (see docstring).
-    multiplier = np.clip(multiplier, 0.10, 1.0)
+    # Lower bound 0.50: the maximum combined protection achievable under any
+    # Round 20 scenario is capped at ~50% of baseline hospitalisations.
+    # Rationale: peak fall coverage ~59% (Scenario D/E), VE_0=55%, but at
+    # the peak of the campaign only ~half the newly-vaccinated cohort has been
+    # vaccinated ≤ 6 weeks (early ramp); the population-level effective VE
+    # is therefore at most ~0.59 × 0.55 × 0.90 ≈ 29%, leaving ≥71% of
+    # events.  The spring high-risk add-on covers only 30% of population at
+    # half the coverage → adds at most ~5% absolute protection.  In practice
+    # the multiplier stays well above 0.50; this floor simply prevents
+    # numerical artefacts from driving near-zero trajectories.
+    multiplier = np.clip(multiplier, 0.50, 1.0)
 
     logger.info(
         "build_scenario_multipliers: scenario %s  "
@@ -776,7 +784,11 @@ def apply_scenario(
         )
         result["multiplier"] = result["multiplier"].fillna(1.0)
 
-    result[forecast_col] = (result[forecast_col] * result["multiplier"]).clip(lower=1.0)
+    # Apply multiplier; do NOT impose a hard absolute floor here — the
+    # trajectory generator already enforces DEFAULT_MIN_COUNT (200 for US
+    # national) via its own clip.  Imposing clip(lower=1) here was masking
+    # the per-scenario amplitude differences.
+    result[forecast_col] = (result[forecast_col] * result["multiplier"]).clip(lower=0.0)
 
     # Attach official scenario metadata
     result["scenario_id"] = spec.scenario_id

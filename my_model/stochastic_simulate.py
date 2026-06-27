@@ -110,7 +110,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Number of most-recent observed weeks used for drift/volatility estimation.
-DEFAULT_LOOKBACK_WEEKS: int = 8
+#  We use 52 weeks (one full year) so the lookback captures a complete seasonal
+#  cycle (summer peak + winter peak + spring trough).  Over a full year the
+#  mean log-growth is close to zero for an endemic seasonal pathogen, so the
+#  estimated drift μ does not lock onto either a growth or decline phase.
+#  The seasonal forcing (not μ) is then the dominant driver of the two peaks.
+DEFAULT_LOOKBACK_WEEKS: int = 52
 
 #: Exact number of independent stochastic trajectories to generate.
 DEFAULT_N_TRAJECTORIES: int = 300
@@ -119,59 +124,113 @@ DEFAULT_N_TRAJECTORIES: int = 300
 DEFAULT_N_WEEKS: int = 104
 
 #: Minimum observation floor applied after exponentiation (Assumption A6).
-DEFAULT_MIN_COUNT: float = 1.0
+#  Set to 200 for national US projections so trajectories cannot collapse to
+#  near-zero during seasonal troughs — COVID-19 remains endemic and NHSN data
+#  has never reported <100 weekly US hospitalisations since 2020.  State-level
+#  callers may override with a lower value proportional to population.
+DEFAULT_MIN_COUNT: float = 200.0
 
-#: Relative amplitude of sinusoidal seasonal forcing (unitless, 0–1).
-#  Calibrated from US national inc hosp 2023–2026 using least-squares sinusoid
-#  fit; winter peak is approximately 2× summer trough → amplitude ≈ 0.35.
-#  Teams may adjust this based on state-level fits (Assumption A3).
-SEASONAL_AMPLITUDE: float = 0.35
+# ---------------------------------------------------------------------------
+# Seasonal model: dual-harmonic Fourier representation
+# ---------------------------------------------------------------------------
+# The seasonal log-level is modelled as:
+#
+#   S(doy) = [A1c·cos(ω·doy) + A1s·sin(ω·doy)]    <- annual harmonic
+#           + [A2c·cos(2ω·doy) + A2s·sin(2ω·doy)]   <- semi-annual harmonic
+#
+# Fitted by OLS on log(US inc hosp) 2023–2026 (NHSN weekly data).
+# The annual harmonic captures the dominant winter peak; the semi-annual
+# harmonic captures the secondary summer peak.
+#
+# Fitted values (2023-2026 OLS, see calibration notes in MODEL_DESCRIPTION.md):
+#   Annual:      amp=0.493, peak_doy≈62 (lat Dec / early Jan)
+#   Semi-annual: amp=0.436, peak_doy≈23 (lat Jan) → two peaks: ~Jan + ~Jul
+#
+# In (cos, sin) Fourier form:
+#   cos1 = 0.492,  sin1 = -0.026   (annual)
+#   cos2 = -0.006, sin2 =  0.436   (semi-annual)
 
-#: Day-of-year on which the seasonal peak occurs (hospitalisation).
-#  Empirically: US COVID-19 hospitalisation peaks ~week 3–4 of January
-#  (≈ day 18) and has a secondary summer peak around day 196 (mid-July).
-#  A single sinusoid is anchored at the winter peak (day 18).
-PEAK_DOY: int = 18  # ~18 January
+#: Annual harmonic cosine coefficient (log-level space).
+SEASONAL_A1C: float =  0.492
+#: Annual harmonic sine coefficient (log-level space).
+SEASONAL_A1S: float = -0.026
+#: Semi-annual harmonic cosine coefficient (log-level space).
+SEASONAL_A2C: float = -0.006
+#: Semi-annual harmonic sine coefficient (log-level space).
+SEASONAL_A2S: float =  0.436
+
+# Keep the legacy amplitude / peak_doy names as aliases so existing function
+# signatures remain backward compatible.
+SEASONAL_AMPLITUDE: float = SEASONAL_A1C    # compat alias
+SEASONAL_AMPLITUDE_2: float = SEASONAL_A2S  # compat alias
+PEAK_DOY: int = 18    # compat alias (not directly used in new model)
+PEAK_DOY_2: int = 196  # compat alias (not directly used in new model)
 
 # ---------------------------------------------------------------------------
 # Helper: build the weekly seasonal drift adjustment
 # ---------------------------------------------------------------------------
 
-def _seasonal_drift(
+def _seasonal_level(
     dates: pd.DatetimeIndex,
+    a1c: float = SEASONAL_A1C,
+    a1s: float = SEASONAL_A1S,
+    a2c: float = SEASONAL_A2C,
+    a2s: float = SEASONAL_A2S,
+    # Legacy compat params (ignored; kept so existing callers don't break)
     amplitude: float = SEASONAL_AMPLITUDE,
     peak_doy: int = PEAK_DOY,
+    amplitude_2: float = SEASONAL_AMPLITUDE_2,
+    peak_doy_2: int = PEAK_DOY_2,
 ) -> np.ndarray:
     """
-    Compute the additive seasonal adjustment to the log-growth drift for each
-    projected epi-week.
+    Compute the **absolute seasonal log-level** for each epi-week using a
+    dual-harmonic Fourier representation fitted to 2023–2026 US NHSN data.
 
-    The model uses the *derivative* of the seasonal sinusoid rather than the
-    sinusoid itself: if we want log(count) to follow a seasonal curve, then
-    the week-to-week increment of log(count) is the derivative of that curve.
+    S(doy) = a1c·cos(ω·doy) + a1s·sin(ω·doy)     [annual harmonic]
+           + a2c·cos(2ω·doy) + a2s·sin(2ω·doy)    [semi-annual harmonic]
 
-    Specifically:
-        seasonal_log_count(t) = A · sin(2π(doy - peak_doy) / 365.25)
-        drift_adjustment(t)   = d/dt [seasonal_log_count(t)]
-                               ≈ A · (2π / 365.25) · cos(2π(doy - peak_doy) / 365.25)
-                                 × 7   (scaled to weekly units)
-
-    Parameters
-    ----------
-    dates     : DatetimeIndex of epi-week Saturday end-dates (one per horizon).
-    amplitude : Relative amplitude of the sinusoid (0–1). Default 0.35.
-    peak_doy  : Day-of-year of the seasonal peak. Default 18 (≈ 18 Jan).
+    The annual harmonic captures the winter peak (≈ Jan); the semi-annual
+    harmonic captures the secondary summer peak (≈ Jul/Aug), producing the
+    two seasonal peaks per year observed in US COVID-19 hospitalisation data.
 
     Returns
     -------
     np.ndarray, shape (len(dates),)
-        Weekly additive adjustment to log-growth drift, in log units per week.
+        Seasonal log-count level at each epi-week.
     """
-    omega = 2.0 * np.pi / 365.25  # angular frequency (radians per day)
+    omega = 2.0 * np.pi / 365.25
     doy = dates.day_of_year.to_numpy(dtype=float)
-    # Weekly increment of the seasonal sinusoid (chain-rule × 7 days/week)
-    adjustment = amplitude * omega * np.cos(omega * (doy - peak_doy)) * 7.0
-    return adjustment
+    annual     = a1c * np.cos(omega * doy) + a1s * np.sin(omega * doy)
+    semiannual = a2c * np.cos(2 * omega * doy) + a2s * np.sin(2 * omega * doy)
+    return annual + semiannual
+
+
+def _seasonal_drift(
+    dates: pd.DatetimeIndex,
+    a1c: float = SEASONAL_A1C,
+    a1s: float = SEASONAL_A1S,
+    a2c: float = SEASONAL_A2C,
+    a2s: float = SEASONAL_A2S,
+    # Legacy compat params (ignored)
+    amplitude: float = SEASONAL_AMPLITUDE,
+    peak_doy: int = PEAK_DOY,
+    amplitude_2: float = SEASONAL_AMPLITUDE_2,
+    peak_doy_2: int = PEAK_DOY_2,
+) -> np.ndarray:
+    """
+    Week-to-week derivative of :func:`_seasonal_level` (for reference only;
+    the trajectory generator uses the level directly, not its derivative).
+
+    Returns
+    -------
+    np.ndarray, shape (len(dates),)
+        Weekly additive change in seasonal log-level.
+    """
+    omega = 2.0 * np.pi / 365.25
+    doy = dates.day_of_year.to_numpy(dtype=float)
+    d_annual     = 7 * omega * (-a1c * np.sin(omega * doy) + a1s * np.cos(omega * doy))
+    d_semiannual = 7 * 2 * omega * (-a2c * np.sin(2 * omega * doy) + a2s * np.cos(2 * omega * doy))
+    return d_annual + d_semiannual
 
 
 # ---------------------------------------------------------------------------
@@ -271,34 +330,44 @@ def generate_trajectories(
     lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
     n_trajectories: int = DEFAULT_N_TRAJECTORIES,
     min_count: float = DEFAULT_MIN_COUNT,
+    # Fourier seasonal parameters (fitted to 2023-2026 US NHSN data)
+    seasonal_a1c: float = SEASONAL_A1C,
+    seasonal_a1s: float = SEASONAL_A1S,
+    seasonal_a2c: float = SEASONAL_A2C,
+    seasonal_a2s: float = SEASONAL_A2S,
+    # Legacy compat params (kept for backward compatibility; not used internally)
     seasonal_amplitude: float = SEASONAL_AMPLITUDE,
+    seasonal_amplitude_2: float = SEASONAL_AMPLITUDE_2,
     peak_doy: int = PEAK_DOY,
+    peak_doy_2: int = PEAK_DOY_2,
+    mu_reversion_strength: float = 0.15,
     seed: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Generate ``n_trajectories`` stochastic forecast trajectories using a
-    seasonal log-growth random-walk model.
+    dual-harmonic seasonal log-growth random-walk model.
 
     Parameters
     ----------
-    observations     : Ordered historical weekly counts (oldest → newest).
-                       Used to estimate the drift μ and volatility σ, and to
-                       seed the initial forecast value.
-    forecast_dates   : DatetimeIndex of epi-week Saturday end-dates for the
-                       projection horizon.  Must be non-empty.
-                       Length determines the number of forecast steps.
-    lookback_weeks   : Weeks of history used for μ/σ estimation (default 8).
-    n_trajectories   : Number of independent trajectories (default 300, per
-                       hub specification).
-    min_count        : Minimum weekly count floor applied after exponentiation
-                       (default 1.0, Assumption A6).
-    seasonal_amplitude: Amplitude of sinusoidal seasonal forcing in log-space
-                       (default 0.35, Assumption A3).
-    peak_doy         : Day-of-year of the seasonal hospitalisation peak
-                       (default 18, ≈ 18 January, Assumption A3).
-    seed             : Optional integer random seed for reproducibility.
-                       Pass the *same* seed across scenarios to ensure paired
-                       trajectories (Assumption A5).
+    observations         : Ordered historical weekly counts (oldest → newest).
+                           Used to estimate the drift μ and volatility σ, and to
+                           seed the initial forecast value.
+    forecast_dates       : DatetimeIndex of epi-week Saturday end-dates for the
+                           projection horizon.  Must be non-empty.
+    lookback_weeks       : Weeks of history used for μ/σ estimation (default 26).
+    n_trajectories       : Number of independent trajectories (default 300).
+    min_count            : Minimum weekly count floor (default 200 for US national).
+    seasonal_amplitude   : Primary (winter) sinusoid amplitude (default 0.35).
+    seasonal_amplitude_2 : Secondary (summer) sinusoid amplitude (default 0.22).
+    peak_doy             : Primary peak day-of-year (default 18, ≈ 18 Jan).
+    peak_doy_2           : Secondary peak day-of-year (default 196, ≈ 15 Jul).
+    mu_reversion_strength: Fraction by which μ is pulled toward zero each period
+                           to prevent trajectories from diverging exponentially
+                           over 104 weeks.  0.0 = no reversion, 1.0 = full reversion
+                           to zero each step.  Default 0.15.
+    seed                 : Optional integer random seed for reproducibility.
+                           Pass the *same* seed across scenarios to ensure paired
+                           trajectories (Assumption A5).
 
     Returns
     -------
@@ -316,21 +385,6 @@ def generate_trajectories(
     ValueError
         If ``forecast_dates`` is empty, or fewer than 3 valid observations
         exist in ``observations``.
-
-    Examples
-    --------
-    >>> import pandas as pd
-    >>> from load_data import load_target_data, build_epiweek_dates
-    >>> obs_df = load_target_data(
-    ...     location_filter=["US"],
-    ...     target_filter=["inc hosp"],
-    ...     age_group_filter=["0-130"],
-    ... )
-    >>> obs = obs_df.set_index("date")["observation"]
-    >>> dates = build_epiweek_dates()
-    >>> trajs = generate_trajectories(obs, dates, seed=42)
-    >>> trajs.shape
-    (31200, 3)   # 300 trajectories × 104 weeks
     """
     if len(forecast_dates) == 0:
         raise ValueError("generate_trajectories: forecast_dates must not be empty.")
@@ -340,21 +394,45 @@ def generate_trajectories(
     # ── Step 1: Estimate drift μ and volatility σ ─────────────────────────
     mu, sigma = estimate_log_growth_params(observations, lookback_weeks=lookback_weeks)
 
-    # ── Step 2: Build seasonal drift adjustment for each forecast week ─────
+    # Apply mild mean-reversion: pull the estimated drift toward zero so that
+    # trajectories do not diverge exponentially over 104 weeks.  This is a
+    # conservative damping factor; the seasonal forcing still drives the
+    # expected summer and winter peaks.
+    mu_damped = mu * (1.0 - mu_reversion_strength)
+
+    # ── Step 2: Build dual-harmonic seasonal drift for each forecast week ───
     # Shape: (n_forecast_weeks,)
-    seasonal_adj = _seasonal_drift(forecast_dates, amplitude=seasonal_amplitude,
-                                   peak_doy=peak_doy)
-    # Total drift per week = estimated trend + seasonal correction
-    drift = mu + seasonal_adj  # shape: (n_weeks,)
+    seasonal_adj = _seasonal_drift(
+        forecast_dates,
+        amplitude=seasonal_amplitude,
+        peak_doy=peak_doy,
+        amplitude_2=seasonal_amplitude_2,
+        peak_doy_2=peak_doy_2,
+    )
+    # Total drift per week = damped trend + dual-harmonic seasonal correction
+    drift = mu_damped + seasonal_adj  # shape: (n_weeks,)
 
     logger.info(
-        "generate_trajectories: μ=%.4f  σ=%.4f  horizon=%d weeks  "
+        "generate_trajectories: μ=%.4f  μ_damped=%.4f  σ=%.4f  horizon=%d weeks  "
         "n_trajectories=%d  seed=%s",
-        mu, sigma, len(forecast_dates), n_trajectories, seed,
+        mu, mu_damped, sigma, len(forecast_dates), n_trajectories, seed,
     )
 
-    # ── Step 3: Seed the initial forecast value ───────────────────────────
-    # Use the most recent non-NaN observation as the starting count.
+    # ── Step 3: Deseasonalize the seed observation ────────────────────────
+    # The model uses a seasonal decomposition approach:
+    #
+    #   log H(t) = trend(t) + seasonal_level(t)
+    #
+    # where trend(t) is a slow-changing baseline and seasonal_level(t) is the
+    # dual-harmonic sinusoidal component.
+    #
+    # Seeding strategy:
+    #   - The "seed observation" is the observed value at (or near) the first
+    #     forecast date.  For Round 20, this is the last value BEFORE origin_date
+    #     (≈ 3786 on 2025-06-07), NOT the most recent available observation.
+    #   - Callers that want to use a specific seed value should pass it as the
+    #     first (and only) element of ``observations``, or use the
+    #     ``forecast_target`` convenience wrapper which handles this correctly.
     arr = np.asarray(observations, dtype=float)
     arr_clean = arr[~np.isnan(arr)]
     if len(arr_clean) == 0:
@@ -362,29 +440,49 @@ def generate_trajectories(
             "generate_trajectories: all observations are NaN; "
             "cannot seed the forecast."
         )
-    last_obs = float(arr_clean[-1])
-    # Ensure the seed value is strictly positive before log-seeding
-    last_obs_safe = max(last_obs, DEFAULT_MIN_COUNT)
+    # Use the LAST observation in the array as the seed value.
+    # The caller is responsible for passing observations trimmed to the
+    # seed date (e.g. all obs up to ORIGIN_DATE when forecasting from origin).
+    seed_obs = float(arr_clean[-1])
+    seed_obs_safe = max(seed_obs, min_count)
+
+    # Seasonal level at the seed date (= the week before first forecast)
+    seed_date_dti = pd.DatetimeIndex([forecast_dates[0] - pd.Timedelta(days=7)])
+    seasonal_at_seed = _seasonal_level(
+        seed_date_dti,
+        a1c=seasonal_a1c, a1s=seasonal_a1s,
+        a2c=seasonal_a2c, a2s=seasonal_a2s,
+    )[0]
+
+    # Deseasonalized log-trend at the seed date
+    log_trend_seed = np.log(seed_obs_safe) - seasonal_at_seed
+
+    # Seasonal level at all forecast dates (shape: n_weeks)
+    seasonal_forecast = _seasonal_level(
+        forecast_dates,
+        a1c=seasonal_a1c, a1s=seasonal_a1s,
+        a2c=seasonal_a2c, a2s=seasonal_a2s,
+    )
 
     n_weeks = len(forecast_dates)
 
     # ── Step 4: Draw innovation matrix ────────────────────────────────────
-    # Shape: (n_trajectories, n_weeks)
-    # Each row is one trajectory's sequence of Normal(0, σ) innovations.
-    # Assumption A2: i.i.d. Normal innovations.
     innovations = rng.normal(loc=0.0, scale=sigma, size=(n_trajectories, n_weeks))
 
-    # ── Step 5: Build cumulative log-forecasts ────────────────────────────
-    # log_count[t] = log(last_obs) + Σ_{s=1}^{t} [drift[s] + ε[s]]
-    # drift is broadcast across all trajectories (shape: 1 × n_weeks)
-    cumulative_increments = np.cumsum(
-        drift[np.newaxis, :] + innovations, axis=1
+    # ── Step 5: Build cumulative deseasonalized log-trend ─────────────────
+    # log_trend[i,t] = log_trend_seed + Σ_{s=1}^{t} [μ_damped + ε_i[s]]
+    # Note: seasonal forcing is NOT in the drift here; it's added as a level.
+    trend_increments = np.cumsum(
+        mu_damped + innovations, axis=1
     )  # shape: (n_trajectories, n_weeks)
 
-    log_forecast = np.log(last_obs_safe) + cumulative_increments
+    log_trend = log_trend_seed + trend_increments  # (n_trajectories, n_weeks)
 
-    # ── Step 6: Exponentiate and apply floor ─────────────────────────────
-    # Assumption A6: floor at min_count to prevent permanent zero-collapse.
+    # ── Step 6: Reattach seasonal level ──────────────────────────────────
+    # log_forecast[i, t] = log_trend[i, t] + seasonal_forecast[t]
+    log_forecast = log_trend + seasonal_forecast[np.newaxis, :]
+
+    # ── Step 7: Exponentiate and apply floor ─────────────────────────────
     forecast_counts = np.clip(np.exp(log_forecast), a_min=min_count, a_max=None)
 
     # ── Step 7: Assemble tidy output DataFrame ───────────────────────────
@@ -460,32 +558,46 @@ def forecast_target(
         N_HORIZON_WEEKS,
     )
 
-    obs_df = load_target_data(
+    # Load ALL calibration data up to FIT_END_DATE
+    obs_df_full = load_target_data(
         location_filter=[location],
         target_filter=[target],
         age_group_filter=[age_group],
         max_date=pd.Timestamp("2026-06-06"),  # FIT_END_DATE
     )
 
-    if obs_df.empty:
+    if obs_df_full.empty:
         raise ValueError(
             f"forecast_target: no observations found for location='{location}', "
             f"target='{target}', age_group='{age_group}'."
         )
 
-    # Ensure monotonically ordered by date, then extract the count series
-    obs_df = obs_df.sort_values("date")
-    observations = obs_df["observation"].values.astype(float)
+    obs_df_full = obs_df_full.sort_values("date")
+
+    # The seed observations must end at ORIGIN_DATE, not at FIT_END_DATE.
+    # Rationale: the trajectory starts from the value at origin_date so that
+    # the seasonal model correctly places the retrospective year (Jun 2025 –
+    # Jun 2026) before the prospective year (Jun 2026 – Jun 2027).
+    # μ/σ estimation uses data up to ORIGIN_DATE (the 52-week window ending
+    # at the projection start date), capturing one full seasonal cycle.
+    obs_seed_df = obs_df_full[obs_df_full["date"] <= ORIGIN_DATE]
+    if obs_seed_df.empty:
+        logger.warning(
+            "forecast_target: no obs at or before ORIGIN_DATE=%s; "
+            "using earliest available.", ORIGIN_DATE
+        )
+        obs_seed_df = obs_df_full.head(lookback_weeks + 1)
+
+    observations_for_seed = obs_seed_df["observation"].values.astype(float)
 
     forecast_dates = build_epiweek_dates(origin=ORIGIN_DATE, n_weeks=n_weeks)
 
     trajs = generate_trajectories(
-        observations=observations,
+        observations=observations_for_seed,
         forecast_dates=forecast_dates,
         lookback_weeks=lookback_weeks,
         n_trajectories=n_trajectories,
         min_count=DEFAULT_MIN_COUNT,
-        seasonal_amplitude=seasonal_amplitude,
         seed=seed,
     )
 

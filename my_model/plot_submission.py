@@ -100,8 +100,20 @@ VAX_LINES: List[Tuple[str, str]] = [
 # Calibration data cutoff (no observations after this date)
 FIT_END_DATE: pd.Timestamp = pd.Timestamp("2026-06-06")
 
-# Round 20 origin date
+# Round 20 origin date and projection end
 ORIGIN_DATE: pd.Timestamp = pd.Timestamp("2025-06-08")
+PROJECTION_END_DATE: pd.Timestamp = pd.Timestamp("2027-06-05")  # horizon 104
+
+# Pre-projection window to show (8 weeks of observed history before origin)
+CHART_START_DATE: pd.Timestamp = ORIGIN_DATE - pd.Timedelta(weeks=8)
+
+# Large US states to highlight in state-level comparison plot
+# Chosen to represent diverse geography/population sizes for visible differences
+STATE_HIGHLIGHT: List[str] = ["06", "48", "12", "36", "17"]   # CA, TX, FL, NY, IL
+STATE_NAMES: Dict[str, str] = {
+    "06": "California", "48": "Texas", "12": "Florida",
+    "36": "New York",   "17": "Illinois",
+}
 
 # ---------------------------------------------------------------------------
 # Global matplotlib style settings
@@ -314,12 +326,20 @@ def _draw_vax_lines(
 
 
 def _format_date_axis(ax: plt.Axes, n_weeks: int = 104) -> None:
-    """Apply consistent date formatting and rotation to the x-axis."""
-    # Major ticks every 3 months, minor every month
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    """Apply consistent date formatting for a 2-year projection window.
+
+    The chart spans from 8 weeks before the origin (Jun 2025) through all
+    104 projected horizons (Jun 2027).  Major ticks every 6 months with
+    month+year labels; minor ticks every month for readability.
+    """
+    # Major ticks every 6 months (Jan and Jul) for a clean 2-year view
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
     ax.xaxis.set_minor_locator(mdates.MonthLocator(interval=1))
-    ax.tick_params(axis="x", which="minor", length=2)
+    ax.tick_params(axis="x", which="major", labelsize=8)
+    ax.tick_params(axis="x", which="minor", length=2, labelsize=0)
+    # Ensure the full projection window is visible
+    ax.set_xlim(CHART_START_DATE, PROJECTION_END_DATE + pd.Timedelta(weeks=2))
 
 
 def _format_yaxis(ax: plt.Axes) -> None:
@@ -418,7 +438,6 @@ def plot_scenario_comparison(
         ax.set_title(meta["title"])
         ax.set_xlabel("Date")
         ax.set_ylabel(meta["ylabel"])
-        _format_date_axis(ax)
         _format_yaxis(ax)
 
         # Shade the retrospective period (Jun 2025 → Jun 2026)
@@ -426,10 +445,7 @@ def plot_scenario_comparison(
                    color="#eeeeee", alpha=0.4, zorder=0,
                    label="Retrospective period")
 
-        ax.set_xlim(
-            ORIGIN_DATE - pd.Timedelta(weeks=8),
-            ORIGIN_DATE + pd.Timedelta(weeks=105),
-        )
+        _format_date_axis(ax)  # sets xlim to full 2-year window
         ax.set_ylim(bottom=0)
 
         # Draw vaccination lines after ylim is set
@@ -555,12 +571,8 @@ def plot_submission(
         ax.set_title(meta["title"], pad=6)
         ax.set_ylabel(meta["ylabel"])
         ax.set_xlabel("")
-        _format_date_axis(ax)
+        _format_date_axis(ax)   # sets xlim to full 2-year window
         _format_yaxis(ax)
-        ax.set_xlim(
-            ORIGIN_DATE - pd.Timedelta(weeks=8),
-            ORIGIN_DATE + pd.Timedelta(weeks=105),
-        )
         ax.set_ylim(bottom=0)
 
         # Vaccination lines (after ylim is set so annotation y is correct)
@@ -616,7 +628,155 @@ def plot_submission(
 
 
 # ===========================================================================
-# Section 5 – Convenience wrapper: generate_all_plots
+# Section 5 – State-level comparison figure
+# ===========================================================================
+
+def plot_state_comparison(
+    df: pd.DataFrame,
+    output_path: pathlib.Path,
+    states: List[str] = STATE_HIGHLIGHT,
+    state_names: Dict[str, str] = STATE_NAMES,
+    target: str = "inc hosp",
+    age_group: str = "0-130",
+    scenarios: Optional[List[str]] = None,
+) -> pathlib.Path:
+    """
+    Multi-panel figure showing scenario differences across key US states.
+
+    Each row = one state; each column = one scenario.  The median trajectory
+    is plotted for every scenario in each state panel, making it easy to see
+    how the scenario spread (Scenario A counterfactual vs optimistic Scenario E)
+    differs by geography.
+
+    A summary bottom row shows the *absolute difference* between Scenario A
+    (no further vaccination) and Scenario E (optimistic semi-annual) for each
+    state on the same axes, making geographic differences immediately apparent.
+
+    Parameters
+    ----------
+    df         : Submission DataFrame (from :func:`load_submission`).
+    output_path: Destination PNG path.
+    states     : FIPS codes to include (default: CA, TX, FL, NY, IL).
+    state_names: Mapping FIPS → display name.
+    target     : Target to display (default ``"inc hosp"``).
+    age_group  : Age group filter.
+    scenarios  : Scenario IDs to overlay; defaults to all five.
+
+    Returns
+    -------
+    pathlib.Path  The saved file path.
+    """
+    if scenarios is None:
+        scenarios = [s for s in SCENARIO_STYLE if s in df["scenario_id"].unique()]
+
+    # Filter to states that are present in the submission
+    available_states = df["location"].unique()
+    states = [s for s in states if s in available_states]
+
+    if not states:
+        logger.warning(
+            "plot_state_comparison: none of the requested states (%s) are "
+            "present in the submission.  Skipping.", states
+        )
+        return output_path
+
+    n_states = len(states)
+    # Main grid: one row per state, one column per scenario
+    # Plus a bottom summary row showing A vs E absolute difference
+    fig, axes = plt.subplots(
+        n_states + 1, 1,
+        figsize=(14, 3.2 * (n_states + 1)),
+        sharex=True,
+    )
+
+    for row_idx, fips in enumerate(states):
+        ax = axes[row_idx]
+        state_df = df[(df["location"] == fips) & (df["age_group"] == age_group)]
+
+        for sid in scenarios:
+            label, color, linestyle = SCENARIO_STYLE.get(
+                sid, (sid, "#999999", "solid")
+            )
+            p50 = _get_quantile_series(state_df, sid, target, 0.50, age_group)
+            p05 = _get_quantile_series(state_df, sid, target, 0.05, age_group)
+            p95 = _get_quantile_series(state_df, sid, target, 0.95, age_group)
+            if p50.empty:
+                continue
+            common_idx = p50.index
+            p05 = p05.reindex(common_idx).ffill().bfill()
+            p95 = p95.reindex(common_idx).ffill().bfill()
+            ax.fill_between(common_idx, p05.values, p95.values,
+                            color=color, alpha=0.10, linewidth=0)
+            ax.plot(common_idx, p50.values, color=color,
+                    linestyle=linestyle, linewidth=1.6,
+                    label=label if row_idx == 0 else "_nolegend_")
+
+        # State label as y-axis title
+        name = state_names.get(fips, fips)
+        ax.set_ylabel(f"{name}\n({fips})", fontsize=9, labelpad=4)
+        ax.set_title(f"{name} – {target}", fontsize=9, pad=3)
+        _format_yaxis(ax)
+        ax.set_ylim(bottom=0)
+        ax.axvspan(ORIGIN_DATE, FIT_END_DATE, color="#eeeeee", alpha=0.4, zorder=0)
+
+    # ── Summary row: Absolute scenario spread (A minus E per state) ────────
+    ax_summary = axes[-1]
+    ax_summary.set_title(
+        "Scenario A − Scenario E  (absolute hospitalisation difference by state)\n"
+        "Positive = Scenario A has more hospitalisations = vaccination benefit",
+        fontsize=9, pad=4,
+    )
+    ax_summary.set_ylabel("Hosp difference\n(A − E)", fontsize=9)
+    ax_summary.axhline(0, color="black", linewidth=0.8, linestyle="--")
+
+    for fips in states:
+        state_df = df[(df["location"] == fips) & (df["age_group"] == age_group)]
+        p50_a = _get_quantile_series(state_df, "A-2026-05-11", target, 0.50, age_group)
+        p50_e = _get_quantile_series(state_df, "E-2026-05-11", target, 0.50, age_group)
+        if p50_a.empty or p50_e.empty:
+            continue
+        common = p50_a.index.intersection(p50_e.index)
+        diff = p50_a.reindex(common) - p50_e.reindex(common)
+        name = state_names.get(fips, fips)
+        ax_summary.plot(common, diff.values, linewidth=1.5,
+                        label=name)
+
+    ax_summary.legend(fontsize=8, loc="upper left", framealpha=0.9)
+    ax_summary.axvspan(ORIGIN_DATE, FIT_END_DATE, color="#eeeeee", alpha=0.4, zorder=0)
+    _format_yaxis(ax_summary)
+
+    # Apply date formatting only to the bottom axis (sharex)
+    _format_date_axis(ax_summary)
+    ax_summary.set_xlabel("Date")
+
+    # ── Shared legend ──────────────────────────────────────────────────────
+    handles, labels_leg = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles, labels_leg,
+            loc="lower center",
+            ncol=min(len(handles), 5),
+            bbox_to_anchor=(0.5, -0.01),
+            fontsize=8,
+            frameon=True,
+        )
+
+    fig.suptitle(
+        f"COVID-19 Round 20 — State-Level Scenario Comparison\n"
+        f"Target: {target.title()} · Age group: {age_group} · Jun 2025–Jun 2027",
+        fontsize=12, fontweight="bold", y=1.005,
+    )
+
+    fig.tight_layout(rect=[0, 0.02, 1, 1])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("plot_state_comparison: saved → %s", output_path)
+    return output_path
+
+
+# ===========================================================================
+# Section 6 – Convenience wrapper: generate_all_plots
 # ===========================================================================
 
 def generate_all_plots(
@@ -638,8 +798,9 @@ def generate_all_plots(
 
     Returns
     -------
-    dict with keys ``"scenario_comparison"`` and ``"submission_plot"``,
-    values are the absolute paths of the written PNG files.
+    dict with keys ``"scenario_comparison"``, ``"submission_plot"``, and
+    ``"state_comparison"``, each mapping to the absolute path of the
+    written PNG file.
     """
     if output_dir is None:
         output_dir = parquet_path.parent
@@ -676,6 +837,23 @@ def generate_all_plots(
         location=location,
     )
     paths["submission_plot"] = p2
+
+    # Figure 3 – state-level comparison (CA, TX, FL, NY, IL vs all scenarios)
+    # Only generated when multi-state data is present in the submission
+    state_locations = [s for s in STATE_HIGHLIGHT if s in df["location"].unique()]
+    if state_locations:
+        p3 = plot_state_comparison(
+            df,
+            output_path=output_dir / "state_comparison.png",
+            states=state_locations,
+            age_group=age_group,
+        )
+        paths["state_comparison"] = p3
+    else:
+        logger.info(
+            "generate_all_plots: no state-level data found in submission "
+            "(only 'US' location present); skipping state_comparison plot."
+        )
 
     return paths
 
