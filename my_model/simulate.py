@@ -387,14 +387,22 @@ def _calibration_loss(
     obs_hosp: np.ndarray,
     population: int,
     start_epiweek: int,
+    weights: Optional[np.ndarray] = None,
 ) -> float:
     """
-    Least-squares loss in log-space between simulated and observed hosp.
+    Weighted least-squares loss in log-space between simulated and observed hosp.
 
     Parameters ``theta`` = [log10_beta0, seasonal_amp, seasonal_phase,
                              log10_p_hosp, log10_i0].
 
-    Returns sum of squared log-residuals (ignores NaN observations).
+    weights : 1-D float array of length len(obs_hosp).  Each squared
+              log-residual is multiplied by the corresponding weight before
+              summation, so higher-weight weeks pull the fit more strongly.
+              Weights are internally normalised to sum to n_valid so the
+              loss magnitude stays comparable to the unweighted version.
+              None → uniform weights (legacy behaviour).
+
+    Returns weighted sum of squared log-residuals (ignores NaN observations).
 
     Parameter bounds (physically motivated):
       log10_beta0  in [-1.5, 0.5]   → β0 in [0.03, 3.16] week⁻¹
@@ -448,7 +456,18 @@ def _calibration_loss(
     log_obs = np.log(np.where(obs_hosp[valid] > 0, obs_hosp[valid], 1.0))
     log_sim = np.log(np.where(sim_hosp[:n_weeks][valid] > 0, sim_hosp[:n_weeks][valid], 1.0))
 
-    fit_loss = float(np.sum((log_obs - log_sim) ** 2))
+    sq_res = (log_obs - log_sim) ** 2
+
+    # ── Apply per-week weights ────────────────────────────────────────────
+    if weights is not None:
+        w = np.asarray(weights, dtype=float)[valid]
+        # Normalise so weights sum to n_valid — loss stays comparable
+        # to the unweighted case and the stability/scale penalties don't
+        # need rescaling.
+        w = w * (float(valid.sum()) / w.sum())
+        fit_loss = float(np.sum(w * sq_res))
+    else:
+        fit_loss = float(np.sum(sq_res))
 
     # ── Stability penalty ─────────────────────────────────────────────────
     # Penalise models where hosp in the extended window exceeds 2× the
@@ -480,20 +499,28 @@ def calibrate_seirs(
     location: str = "US",
     maxiter: int = 1500,
     seed: int = 0,
+    weights: Optional[np.ndarray] = None,
 ) -> SEIRSParams:
     """
     Calibrate SEIRS parameters for one location using Nelder-Mead optimisation
-    on log-space least-squares residuals.
+    on weighted log-space least-squares residuals.
 
     Parameters
     ----------
     obs_hosp       : Array of observed weekly incident hospitalisations
                      (length = calibration window in weeks; NaN = missing).
+                     Should be the most recent CAL_WINDOW_WEEKS observations
+                     for best near-origin alignment.
     population     : Total population of the jurisdiction.
     start_epiweek  : Epi-week (1–52) of the first observation.
     location       : FIPS code (for logging only).
     maxiter        : Maximum Nelder-Mead iterations.
     seed           : Not used (deterministic calibration); kept for API compat.
+    weights        : Optional 1-D float array of length len(obs_hosp).
+                     Larger value → that week's residual counts more.
+                     Typically exponentially increasing so the most recent
+                     weeks dominate (e.g. last week weight ≈ 8× first week).
+                     None → uniform weights.
 
     Returns
     -------
@@ -522,7 +549,7 @@ def calibrate_seirs(
         result = minimize(
             _calibration_loss,
             x0,
-            args=(obs_hosp, population, start_epiweek),
+            args=(obs_hosp, population, start_epiweek, weights),
             method="Nelder-Mead",
             options={"maxiter": maxiter, "xatol": 5e-4, "fatol": 5e-4, "disp": False},
         )
@@ -715,13 +742,25 @@ def get_calibrated_params(
         pop_map = get_population_map()
         population = pop_map.get(location, 330_000_000)
 
-    # ── Calibration data ─────────────────────────────────────────────────
+    # ── Calibration data — most recent 52 weeks before projection origin ──
+    # Using only the last CAL_WINDOW_WEEKS keeps the fitted parameters
+    # representative of the current epidemic trajectory and ensures the
+    # calibration curve aligns closely with the first forecast week.
+    from load_data import ORIGIN_DATE as _ORIGIN  # noqa: PLC0415
+
+    CAL_WINDOW_WEEKS: int = 52
+    # Last Saturday strictly before ORIGIN_DATE (a Sunday)
+    cal_max_date = _ORIGIN - pd.Timedelta(days=1)          # Saturday 2025-06-07
+    cal_min_date = cal_max_date - pd.Timedelta(weeks=CAL_WINDOW_WEEKS - 1)
+    # Never request data before the global calibration start floor
+    cal_min_date = max(cal_min_date, CAL_START)
+
     obs_df = load_target_data(
         location_filter=[location],
         target_filter=["inc hosp"],
         age_group_filter=["0-130"],
-        min_date=CAL_START,
-        max_date=CAL_END,
+        min_date=cal_min_date,
+        max_date=cal_max_date,
     ).sort_values("date")
 
     if obs_df.empty:
@@ -736,6 +775,27 @@ def get_calibrated_params(
 
     obs_hosp      = obs_df["observation"].values.astype(float)
     start_epiweek = int(obs_df["date"].iloc[0].isocalendar()[1])
+    n_cal         = len(obs_hosp)
+
+    # ── Exponential weights: last week ≈ 8× first week ───────────────────
+    # weight[t] = exp(log(8) * t / (n-1))  → [1.0, …, 8.0]
+    # Recent observations dominate so the fitted curve tracks the trend
+    # entering the forecast, keeping the transition gap minimal.
+    WEIGHT_RATIO: float = 8.0
+    raw_weights = np.exp(
+        np.log(WEIGHT_RATIO) * np.arange(n_cal) / max(n_cal - 1, 1)
+    )
+
+    logger.info(
+        "get_calibrated_params [%s]: window %s → %s  n=%d  "
+        "weights [%.2f, %.2f]",
+        location,
+        obs_df["date"].iloc[0].date(),
+        obs_df["date"].iloc[-1].date(),
+        n_cal,
+        raw_weights.min(),
+        raw_weights.max(),
+    )
 
     # ── Calibrate ────────────────────────────────────────────────────────
     params = calibrate_seirs(
@@ -743,6 +803,7 @@ def get_calibrated_params(
         population=population,
         start_epiweek=start_epiweek,
         location=location,
+        weights=raw_weights,
     )
 
     _PARAMS_CACHE[cache_key] = params
@@ -754,15 +815,25 @@ def get_calibrated_params(
 # ===========================================================================
 
 def build_cal_dates(
-    min_date: pd.Timestamp = CAL_START,
-    max_date: pd.Timestamp = CAL_END,
+    min_date: Optional[pd.Timestamp] = None,
+    max_date: Optional[pd.Timestamp] = None,
     location: str = "US",
 ) -> pd.DatetimeIndex:
     """
     Return the DatetimeIndex of epi-week Saturdays within the calibration window
     for which observed data exists.
+
+    Defaults to the same 52-week window used by ``get_calibrated_params`` so
+    that the calibration fit overlay on plots exactly matches what was fitted.
+    Pass explicit ``min_date`` / ``max_date`` to override.
     """
-    from load_data import load_target_data  # noqa: PLC0415
+    from load_data import load_target_data, ORIGIN_DATE as _ORIGIN  # noqa: PLC0415
+
+    if max_date is None:
+        max_date = _ORIGIN - pd.Timedelta(days=1)          # 2025-06-07
+    if min_date is None:
+        min_date = max_date - pd.Timedelta(weeks=51)       # 52-week window
+        min_date = max(min_date, CAL_START)
 
     obs_df = load_target_data(
         location_filter=[location],
