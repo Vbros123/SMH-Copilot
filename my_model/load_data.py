@@ -63,6 +63,19 @@ _VAX_CURVES_PATH = (
     / "COVID_RD20_Vaccination_curves.csv"
 )
 
+# Round 19 vaccination curves — "Historic coverage" scenario contains
+# observed Aug–Dec 2024 uptake from the CDC National Immunization Survey.
+_VAX_CURVES_RD19_PATH = (
+    REPO_ROOT
+    / "auxiliary-data"
+    / "vaccination-coverage"
+    / "COVID_RD19_Vaccination_curves.csv"
+)
+_VAX_CURVES_RD19_REQUIRED_COLS: List[str] = [
+    "Geography", "Age", "Risk_group", "Pop", "Cum.Coverage.Percent",
+    "Scenario", "Date",
+]
+
 # ---------------------------------------------------------------------------
 # Required columns for each source file (validated on load)
 # ---------------------------------------------------------------------------
@@ -516,6 +529,342 @@ def get_national_vax_curve(scenario_id: str) -> pd.DataFrame:
     national.loc[0, "weekly_newly_vaccinated_frac"] = national.loc[0, "cum_vax_frac"]
 
     return national[["date", "cum_vax_frac", "weekly_newly_vaccinated_frac"]]
+
+
+# ===========================================================================
+# Private helper: coverage series → SEIRS multipliers  (O(N log N))
+# ===========================================================================
+
+def _coverage_to_multipliers(
+    dates: pd.DatetimeIndex,
+    cum_coverage_series: pd.Series,
+) -> np.ndarray:
+    """
+    Convert a cumulative vaccination coverage series into weekly SEIRS
+    susceptibility multipliers  M(t) = 1 - P(t).
+
+    Uses the canonical VE function from scenario_adjustments.effective_ve so
+    there is exactly ONE VE implementation in the repository.  There is no
+    circular-import risk: scenario_adjustments does not import from load_data.
+
+    Algorithm: O(N log N) via np.convolve.
+
+        Δcov(s)      = weekly increment of cumulative vaccinated fraction
+        ve_kernel[k] = effective_ve(k)         # VE k weeks after vaccination
+        P(t)         = convolve(Δcov, ve_kernel)[:n]
+        M(t)         = clip(1 - P(t), 0, 1)
+
+    Parameters
+    ----------
+    dates               : Target epi-week Saturday DatetimeIndex.
+    cum_coverage_series : pd.Series indexed by date; values = cumulative
+                          fraction of total population vaccinated (0–1).
+                          Reindexed internally — need not match dates exactly.
+
+    Returns
+    -------
+    np.ndarray of shape (len(dates),), values in [0, 1].
+    1.0 = no protection active.  Lower = vaccination-derived protection.
+    """
+    # Deferred import of the single canonical VE implementation.
+    from scenario_adjustments import (  # noqa: PLC0415
+        effective_ve,
+        VE_HOSP_INITIAL,
+        WANING_HALF_LIFE_WEEKS,
+        WANED_FLOOR,
+        IMMUNE_ESCAPE_PER_YEAR,
+    )
+
+    n = len(dates)
+    if n == 0:
+        return np.ones(0, dtype=float)
+
+    # ── Align coverage to target dates ────────────────────────────────────
+    # Reindex onto the union; forward-fill plateau between campaigns;
+    # then select only requested dates; back-fill 0 for pre-campaign weeks.
+    cov_aligned = (
+        cum_coverage_series
+        .reindex(cum_coverage_series.index.union(dates))
+        .sort_index()
+        .ffill()
+        .reindex(dates)
+        .fillna(0.0)
+        .to_numpy(dtype=float)
+    )
+
+    # ── Weekly increments ─────────────────────────────────────────────────
+    delta_cov = np.diff(cov_aligned, prepend=0.0)
+    delta_cov = np.clip(delta_cov, 0.0, None)  # guard against float jitter
+
+    if delta_cov.sum() == 0.0:
+        return np.ones(n, dtype=float)  # fast path: no vaccination in window
+
+    # ── VE kernel: VE(τ) for τ = 0 … n-1 weeks post-vaccination ─────────
+    tau_vals = np.arange(n, dtype=float)
+    ve_kernel = effective_ve(
+        tau_vals,
+        ve_initial=VE_HOSP_INITIAL,
+        waning_half_life_weeks=WANING_HALF_LIFE_WEEKS,
+        waned_floor=WANED_FLOOR,
+        immune_escape_per_year=IMMUNE_ESCAPE_PER_YEAR,
+    )
+
+    # ── O(N log N) convolution ────────────────────────────────────────────
+    # np.convolve(a, b) has length len(a)+len(b)-1; [:n] gives P(0..n-1).
+    protection = np.convolve(delta_cov, ve_kernel)[:n]
+    protection = np.clip(protection, 0.0, 1.0)
+
+    return np.clip(1.0 - protection, 0.0, 1.0)  # M(t) = 1 - P(t)
+
+
+# ===========================================================================
+# Public API – Section 3b: Historical vaccination coverage
+# ===========================================================================
+
+def get_historical_vax_coverage() -> pd.DataFrame:
+    """
+    Construct a continuous cumulative national vaccination coverage series
+    for the calibration/warm-start period, using only observed data.
+
+    Responsibilities
+    ----------------
+    Returns raw coverage only (date → cum_coverage_frac).
+    Does NOT perform VE calculations — see :func:`_coverage_to_multipliers`.
+
+    Coverage timeline
+    -----------------
+    Period 1  Before 2024-08-04
+        coverage = 0
+
+    Period 2  2024-08-04 → 2024-12-29
+        Source: COVID_RD19_Vaccination_curves.csv, Scenario == "Historic coverage".
+        Observed NIS survey uptake (per vaccination-coverage/README.md).
+        Population-weighted national aggregate using the same arithmetic as
+        get_national_vax_curve():
+            n_vax = (Cum.Coverage.Percent / 100) × Pop
+            cum_coverage_frac = Σ n_vax / Σ Pop
+
+    Period 3  2024-12-29 → 2025-08-17
+        No campaign.  Coverage held at Dec 2024 plateau (forward-fill).
+        Protection wanes; that is handled by the VE model.
+
+    Period 4  2025-08-17 → 2026-02-14
+        Source: COVID_RD20_Vaccination_curves.csv, Scenario "A-2026-05-11".
+        Used ONLY because all Round 20 scenarios share identical 2025-26
+        fall campaign uptake before scenario divergence (round20.md:
+        "the 2025-26 vaccination campaign operates as observed in all
+        scenarios A-E").  This is the shared historical campaign data;
+        Scenario A itself is not described as "observed".
+
+    Period 5  After 2026-02-14
+        No additional campaign.  Coverage held at Feb 2026 plateau.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: date (datetime64[ns]), cum_coverage_frac (float64).
+        One row per weekly Saturday, 2024-01-06 through FIT_END_DATE.
+        Values are monotonically non-decreasing.
+    """
+    # ── Period 2: RD19 "Historic coverage" ───────────────────────────────
+    _check_file_exists(_VAX_CURVES_RD19_PATH)
+    rd19_raw = pd.read_csv(
+        _VAX_CURVES_RD19_PATH,
+        dtype={"Geography": str, "Scenario": str, "Age": str, "Risk_group": str},
+    )
+    _validate_columns(
+        rd19_raw, _VAX_CURVES_RD19_REQUIRED_COLS,
+        source="COVID_RD19_Vaccination_curves.csv",
+    )
+    rd19_raw["Date"] = pd.to_datetime(
+        rd19_raw["Date"], format="%Y-%m-%d", errors="coerce"
+    )
+    rd19_raw["Cum.Coverage.Percent"] = pd.to_numeric(
+        rd19_raw["Cum.Coverage.Percent"], errors="coerce"
+    ).fillna(0.0)
+    rd19_raw["Pop"] = pd.to_numeric(rd19_raw["Pop"], errors="coerce").fillna(0.0)
+
+    rd19_hist = rd19_raw[rd19_raw["Scenario"] == "Historic coverage"].copy()
+    if rd19_hist.empty:
+        logger.warning(
+            "get_historical_vax_coverage: no 'Historic coverage' rows in "
+            "COVID_RD19_Vaccination_curves.csv; period 2 will be zero."
+        )
+        rd19_series: pd.Series = pd.Series(dtype=float)
+    else:
+        # Same population-weighting arithmetic as get_national_vax_curve()
+        rd19_hist["n_vax"] = (
+            rd19_hist["Cum.Coverage.Percent"] / 100.0 * rd19_hist["Pop"]
+        )
+        nat = (
+            rd19_hist
+            .groupby("Date", as_index=False)
+            .agg(total_vax=("n_vax", "sum"), total_pop=("Pop", "sum"))
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        nat["cum_coverage_frac"] = (
+            nat["total_vax"] / nat["total_pop"].replace(0.0, np.nan)
+        ).fillna(0.0)
+        rd19_series = nat.set_index("Date")["cum_coverage_frac"]
+
+    # ── Period 4: RD20 Scenario A 2025-26 shared historical campaign ──────
+    rd20_a = get_national_vax_curve("A-2026-05-11")
+    rd20_hist = rd20_a.loc[
+        (rd20_a["date"] >= VAX_FALL_2025_START)
+        & (rd20_a["date"] <= VAX_FALL_2025_END)
+    ].set_index("date")["cum_vax_frac"]
+
+    # ── Build weekly Saturday spine and fill deterministically ───────────
+    # Each period is applied by direct index assignment — no drop_duplicates,
+    # no dataframe-order dependence.  Periods 2 and 4 are non-overlapping.
+    full_spine = pd.Series(
+        0.0,
+        index=pd.date_range(
+            start=pd.Timestamp("2024-01-06"),  # first Saturday >= 2024-01-01
+            end=FIT_END_DATE,
+            freq="7D",
+        ),
+        dtype=float,
+    )
+    # Period 2: overwrite with RD19 observed dates
+    if not rd19_series.empty:
+        overlap = full_spine.index.intersection(rd19_series.index)
+        full_spine.loc[overlap] = rd19_series.loc[overlap]
+    # Period 4: overwrite with RD20 observed dates (non-overlapping with P2)
+    if not rd20_hist.empty:
+        overlap = full_spine.index.intersection(rd20_hist.index)
+        full_spine.loc[overlap] = rd20_hist.loc[overlap]
+
+    # Periods 3 + 5: forward-fill plateau; enforce monotonicity
+    full_spine = full_spine.ffill().fillna(0.0).cummax()
+
+    result = full_spine.reset_index()
+    result.columns = pd.Index(["date", "cum_coverage_frac"])
+    logger.info(
+        "get_historical_vax_coverage: n=%d  coverage [%.4f, %.4f]  %s → %s",
+        len(result),
+        float(result["cum_coverage_frac"].min()),
+        float(result["cum_coverage_frac"].max()),
+        result["date"].iloc[0].date() if len(result) else "n/a",
+        result["date"].iloc[-1].date() if len(result) else "n/a",
+    )
+    return result
+
+
+def build_historical_vax_multipliers(dates: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Convert historical cumulative vaccination coverage into SEIRS
+    susceptibility multipliers aligned to *dates*.
+
+    Accepts dates explicitly so this function is reusable from:
+    - the calibration path  (get_calibrated_params  in simulate.py)
+    - the warm-start path   (generate_trajectories  in stochastic_simulate.py)
+
+    VE mathematics are provided by _coverage_to_multipliers(), which imports
+    effective_ve from scenario_adjustments.py — one canonical VE implementation.
+
+    Parameters
+    ----------
+    dates : pd.DatetimeIndex of epi-week Saturdays.
+
+    Returns
+    -------
+    np.ndarray of shape (len(dates),), values in [0, 1].
+    1.0 = no protection.  Lower = active vaccination-derived protection.
+    """
+    cov_df = get_historical_vax_coverage()
+    cov_series = cov_df.set_index("date")["cum_coverage_frac"]
+    mult = _coverage_to_multipliers(dates, cov_series)
+    logger.debug(
+        "build_historical_vax_multipliers: n=%d  M∈[%.4f, %.4f]",
+        len(mult),
+        float(mult.min()) if len(mult) else float("nan"),
+        float(mult.max()) if len(mult) else float("nan"),
+    )
+    return mult
+
+
+def build_continuous_vax_multipliers(
+    cal_dates: pd.DatetimeIndex,
+    forecast_dates: pd.DatetimeIndex,
+    scenario_id: str,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """
+    Build ONE continuous vaccination multiplier array spanning both the
+    historical calibration period AND the forecast period for *scenario_id*.
+
+    The VE convolution is performed once over the merged coverage timeline,
+    so the immunity state is consistent across calibration → forecast.
+
+    Timeline
+    --------
+    cal_dates[0] ─── historical observed ─── cal_dates[-1]
+                                                   │
+                                          forecast_dates[0] ─── scenario ─── forecast_dates[-1]
+
+    Parameters
+    ----------
+    cal_dates      : Calibration/warm-start epi-week dates.
+    forecast_dates : Forecast epi-week dates (104 weeks).
+    scenario_id    : Hub scenario ID for the future campaign
+                     (e.g. "B-2026-05-11"; use "A-2026-05-11" for no
+                     additional future vaccination).
+
+    Returns
+    -------
+    (cal_mult, forecast_mult) : tuple of two np.ndarrays.
+        cal_mult         shape (len(cal_dates),)
+        forecast_mult    shape (len(forecast_dates),)
+        Both are slices of the same single VE convolution.
+    """
+    # ── Historical coverage (observed) ────────────────────────────────────
+    hist_df = get_historical_vax_coverage()
+    hist_series = hist_df.set_index("date")["cum_coverage_frac"]
+    hist_plateau = float(hist_series.iloc[-1]) if len(hist_series) > 0 else 0.0
+
+    # ── Future scenario coverage (incremental, on top of historical plateau) ─
+    future_cov = pd.Series(0.0, index=forecast_dates, dtype=float)
+    try:
+        rd20 = get_national_vax_curve(scenario_id)
+        # Only the campaign portion after the shared 2025-26 historical campaign
+        rd20_future = rd20.loc[
+            rd20["date"] > VAX_FALL_2025_END
+        ].set_index("date")["cum_vax_frac"]
+        if not rd20_future.empty:
+            # Rebase to 0 so adding hist_plateau gives the correct running total
+            rd20_future = (rd20_future - float(rd20_future.iloc[0])).clip(lower=0.0)
+            overlap = forecast_dates.intersection(rd20_future.index)
+            future_cov.loc[overlap] = rd20_future.loc[overlap]
+    except ValueError:
+        pass  # Scenario A or missing data → no additional future campaign
+
+    # ── Merge onto a single date axis ─────────────────────────────────────
+    all_dates = cal_dates.append(forecast_dates).sort_values().drop_duplicates()
+
+    # Start from the forward-filled historical series
+    combined = (
+        hist_series
+        .reindex(hist_series.index.union(all_dates))
+        .sort_index()
+        .ffill()
+        .fillna(0.0)
+        .reindex(all_dates)
+    )
+    # Add future incremental coverage for forecast dates
+    future_on_full = future_cov.reindex(all_dates).fillna(0.0)
+    combined = combined + future_on_full
+    # Enforce monotonicity (cumulative coverage never decreases)
+    combined = combined.cummax()
+
+    # ── Single VE convolution over the full timeline ───────────────────
+    all_mult = _coverage_to_multipliers(all_dates, combined)
+
+    # ── Split back into calibration and forecast portions ─────────────
+    cal_mask   = pd.Index(all_dates).isin(cal_dates)
+    fcast_mask = pd.Index(all_dates).isin(forecast_dates)
+
+    return all_mult[cal_mask], all_mult[fcast_mask]
 
 
 # ===========================================================================

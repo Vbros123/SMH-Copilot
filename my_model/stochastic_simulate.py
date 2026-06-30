@@ -117,6 +117,7 @@ def generate_trajectories(
     mu_reversion_strength: float = 0.15,
     location: str = "US",
     seed: Optional[int] = None,
+    scenario_id: str = "A-2026-05-11",
 ) -> pd.DataFrame:
     """
     Generate n_trajectories stochastic SEIRS forecast trajectories.
@@ -150,7 +151,13 @@ def generate_trajectories(
         MIN_HOSP_FLOOR,
         CAL_START,
     )
-    from load_data import ORIGIN_DATE, get_population_map, load_target_data
+    from load_data import (
+        ORIGIN_DATE,
+        get_population_map,
+        load_target_data,
+        build_historical_vax_multipliers,
+        build_continuous_vax_multipliers,
+    )
 
     if len(forecast_dates) == 0:
         raise ValueError("generate_trajectories: forecast_dates must not be empty.")
@@ -178,11 +185,20 @@ def generate_trajectories(
     start_epiweek_cal = int(cal_obs_df["date"].iloc[0].isocalendar()[1]) if n_warmup > 0 else 1
 
     if n_warmup > 0:
+        # Apply historical vaccination during the warm-start (CAL_START →
+        # ORIGIN_DATE) so the reconstructed SEIRS compartments at ORIGIN_DATE
+        # reflect real accumulated immunity from the 2024 and 2025-26 campaigns.
+        # The warm-start dates are entirely historical; no future scenario
+        # vaccination is applied here.
+        warmup_vax_mult = build_historical_vax_multipliers(
+            pd.DatetimeIndex(cal_obs_df["date"])
+        )
         warmup = run_seirs(
             params,
             n_weeks=n_warmup,
             start_epiweek=start_epiweek_cal,
             stochastic=False,
+            vax_multipliers=warmup_vax_mult,
         )
         S_init = float(warmup["S"][-1])
         E_init = float(warmup["E"][-1])
@@ -215,11 +231,27 @@ def generate_trajectories(
         location=location,
     )
 
+    # ── Continuous vaccination timeline for forecast ───────────────────
+    # Build one merged coverage curve (historical + future scenario) and
+    # perform the VE convolution once.  The forecast slice is passed into
+    # run_seirs so immunity carries forward continuously from calibration.
+    # scenario_id="A-2026-05-11" (default) means no additional future
+    # campaign — the Scenario A baseline.  Callers pass a different
+    # scenario_id to incorporate future campaign coverage inside SEIRS;
+    # post-hoc scenario_adjustments multipliers still apply on top for
+    # the incremental B–E differences.
+    _, forecast_vax_mult = build_continuous_vax_multipliers(
+        cal_dates=pd.DatetimeIndex(cal_obs_df["date"]),
+        forecast_dates=forecast_dates,
+        scenario_id=scenario_id,
+    )
+
     result_df = generate_seirs_trajectories(
         params=params_at_origin,
         forecast_dates=forecast_dates,
         n_trajectories=n_trajectories,
         seed=seed,
+        vax_multipliers=forecast_vax_mult,
     )
 
     floor = max(float(min_count), float(MIN_HOSP_FLOOR))

@@ -315,7 +315,15 @@ def run_seirs(
         )
 
         # Effective susceptibles (vaccination reduces susceptibility)
-        vax_mult = vax_multipliers[t] if vax_multipliers is not None else 1.0
+        # Bounds check: vax_multipliers covers only the window it was built
+        # for (e.g. the calibration period).  For t beyond that length,
+        # fall back to 1.0 (no vaccination effect).  This allows run_seirs
+        # to be called with n_weeks > len(vax_multipliers) — as in the
+        # stability-extension used by _calibration_loss — without an IndexError.
+        if vax_multipliers is not None and t < len(vax_multipliers):
+            vax_mult = vax_multipliers[t]
+        else:
+            vax_mult = 1.0
         S_eff = S[t] * vax_mult
 
         # Force of infection
@@ -388,6 +396,7 @@ def _calibration_loss(
     population: int,
     start_epiweek: int,
     weights: Optional[np.ndarray] = None,
+    vax_multipliers: Optional[np.ndarray] = None,
 ) -> float:
     """
     Weighted least-squares loss in log-space between simulated and observed hosp.
@@ -441,8 +450,14 @@ def _calibration_loss(
     # Run calibration window + 52 extra weeks to penalise runaway growth
     n_extended = n_weeks + 52
     try:
+        # vax_multipliers has length n_weeks (calibration window only).
+        # run_seirs applies vax_multipliers[t] when t < len(vax_multipliers)
+        # and falls back to 1.0 for t >= len, so the 52-week stability
+        # extension automatically runs unvaccinated — correct, because that
+        # penalty horizon represents the future, not the historical window.
         result = run_seirs(
-            p, n_weeks=n_extended, start_epiweek=start_epiweek, stochastic=False
+            p, n_weeks=n_extended, start_epiweek=start_epiweek, stochastic=False,
+            vax_multipliers=vax_multipliers,
         )
         sim_hosp = result["new_hosp"]
     except Exception:
@@ -470,15 +485,22 @@ def _calibration_loss(
         fit_loss = float(np.sum(sq_res))
 
     # ── Stability penalty ─────────────────────────────────────────────────
-    # Penalise models where hosp in the extended window exceeds 2× the
-    # max observed hospitalisations.  COVID-19 is endemic and should not
-    # generate waves dramatically larger than recent historical peaks.
+    # Penalise models where hosp in the extended window exceeds 10× the
+    # max observed hospitalisations.  Using 10× (not 2×) because the SEIRS
+    # endemic equilibrium can legitimately exceed 2× observed when p_hosp
+    # is large enough to match peak hospitalizations — the model's math
+    # produces high endemic I* even though the 52-week stability window
+    # is in the future and still declining from an epidemic peak.
+    # 2× was blocking correct high-p_hosp solutions by adding ~40,000
+    # penalty units while the fit loss was ~70, forcing the optimizer to
+    # accept a low-p_hosp local minimum.  10× still blocks genuinely
+    # explosive growth while leaving room for the correct solution.
     obs_max = float(np.nanmax(obs_hosp))
     future_hosp = sim_hosp[n_weeks:]
     if len(future_hosp) > 0:
         future_max = float(np.max(future_hosp))
-        # Penalty term: 0 when future_max <= 2*obs_max, growing quadratically above
-        ratio = future_max / (2.0 * obs_max + 1.0)
+        # Penalty term: 0 when future_max <= 10*obs_max, growing quadratically above
+        ratio = future_max / (10.0 * obs_max + 1.0)
         stability_penalty = max(0.0, ratio - 1.0) ** 2 * 100.0
     else:
         stability_penalty = 0.0
@@ -500,6 +522,7 @@ def calibrate_seirs(
     maxiter: int = 1500,
     seed: int = 0,
     weights: Optional[np.ndarray] = None,
+    vax_multipliers: Optional[np.ndarray] = None,
 ) -> SEIRSParams:
     """
     Calibrate SEIRS parameters for one location using Nelder-Mead optimisation
@@ -549,7 +572,7 @@ def calibrate_seirs(
         result = minimize(
             _calibration_loss,
             x0,
-            args=(obs_hosp, population, start_epiweek, weights),
+            args=(obs_hosp, population, start_epiweek, weights, vax_multipliers),
             method="Nelder-Mead",
             options={"maxiter": maxiter, "xatol": 5e-4, "fatol": 5e-4, "disp": False},
         )
@@ -683,19 +706,67 @@ def get_calibration_fit(
     cal_dates: pd.DatetimeIndex,
 ) -> pd.Series:
     """
-    Return the deterministic calibration fit (simulated hospitalisation)
-    as a pd.Series indexed by date.
+    Return the deterministic SEIRS trajectory as a pd.Series indexed by *cal_dates*.
 
-    Used by the plotting module to overlay the fitted curve on observed data.
+    The trajectory is the same one the forecast continues from: it begins at
+    ``CAL_START`` (2024-01-01, the same start used by the warm-start in
+    ``generate_trajectories``), runs deterministically to the end of *cal_dates*,
+    and returns the ``new_hosp`` values only for the requested *cal_dates*.
+
+    This ensures the displayed calibration fit line is the trajectory that the
+    forecast actually continues from, so there is no visual discontinuity at the
+    forecast origin.  Using a shorter starting window (e.g. only the calibration
+    fitting window) produces a different trajectory with different compartment
+    state at the endpoint, creating a spurious visual gap.
+
+    Parameters
+    ----------
+    params    : Calibrated SEIRSParams (from get_calibrated_params).
+    cal_dates : DatetimeIndex of epi-week Saturdays to display.  Typically the
+                fitting window (e.g. Nov 2024 → Jun 2025).
+
+    Returns
+    -------
+    pd.Series indexed by cal_dates, values = weekly incident hospitalisations.
     """
-    start_epiweek = int(cal_dates[0].isocalendar()[1])
-    result = run_seirs(
-        params,
-        n_weeks=len(cal_dates),
-        start_epiweek=start_epiweek,
-        stochastic=False,
+    from load_data import (  # noqa: PLC0415
+        load_target_data,
+        build_historical_vax_multipliers,
     )
-    return pd.Series(result["new_hosp"], index=cal_dates, name="cal_fit")
+
+    # Run from CAL_START so the trajectory matches the warm-start exactly
+    full_obs = load_target_data(
+        location_filter=[params.location],
+        target_filter=["inc hosp"],
+        age_group_filter=["0-130"],
+        min_date=CAL_START,
+        max_date=cal_dates[-1],
+    ).sort_values("date")
+
+    if full_obs.empty:
+        # Fallback: run only over the requested dates (less accurate continuity)
+        start_epiweek = int(cal_dates[0].isocalendar()[1])
+        hist_vax = build_historical_vax_multipliers(cal_dates)
+        result = run_seirs(
+            params, n_weeks=len(cal_dates),
+            start_epiweek=start_epiweek, stochastic=False,
+            vax_multipliers=hist_vax,
+        )
+        return pd.Series(result["new_hosp"], index=cal_dates, name="cal_fit")
+
+    full_dates = pd.DatetimeIndex(full_obs["date"])
+    start_epiweek = int(full_dates[0].isocalendar()[1])
+    hist_vax = build_historical_vax_multipliers(full_dates)
+
+    result = run_seirs(
+        params, n_weeks=len(full_dates),
+        start_epiweek=start_epiweek, stochastic=False,
+        vax_multipliers=hist_vax,
+    )
+    hosp_full = pd.Series(result["new_hosp"], index=full_dates, name="cal_fit")
+
+    # Return only the weeks in cal_dates (overlay window for the plot)
+    return hosp_full.reindex(cal_dates)
 
 
 # ===========================================================================
@@ -735,6 +806,7 @@ def get_calibrated_params(
         load_target_data,
         get_population_map,
         build_epiweek_dates,
+        build_historical_vax_multipliers,
     )
 
     # ── Population ───────────────────────────────────────────────────────
@@ -797,13 +869,22 @@ def get_calibrated_params(
         raw_weights.max(),
     )
 
-    # ── Calibrate ────────────────────────────────────────────────────────
+    # ── Historical vaccination multipliers ───────────────────────────────
+    # Aligned to the calibration observation dates so the optimizer sees
+    # the correct per-week susceptibility reduction during the 2024 and
+    # 2025-26 campaigns, rather than absorbing that benefit into p_hosp.
+    hist_vax_mult = build_historical_vax_multipliers(
+        pd.DatetimeIndex(obs_df["date"])
+    )
+
+    # ── Calibrate ──────────────────────────────────────────────────────
     params = calibrate_seirs(
         obs_hosp=obs_hosp,
         population=population,
         start_epiweek=start_epiweek,
         location=location,
         weights=raw_weights,
+        vax_multipliers=hist_vax_mult,
     )
 
     _PARAMS_CACHE[cache_key] = params
